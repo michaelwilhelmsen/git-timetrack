@@ -11,7 +11,15 @@ Then on Friday, you run one command and get:
 - Time estimates based on commit patterns
 - Optionally: client-ready email drafts
 
+## Requirements
+
+- macOS or Linux (uses Unix file locking — not compatible with Windows)
+- Python 3.6+
+- Git
+
 ## Install
+
+Review the script first if you like — it's a single file:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/michaelwilhelmsen/git-timetrack/main/install.sh | bash
@@ -33,6 +41,8 @@ The installer asks how you want to track:
 | **Global git hooks** | Sets `core.hooksPath` to intercept git across all repos | Everyone else |
 
 Both modes log to the same file. You can use both at once.
+
+> **Note:** If you already use a git hooks manager (husky, lefthook, pre-commit), the global git hooks mode will override `core.hooksPath`. The installer warns you if a conflict is detected. Claude Code mode has no such conflict — it works alongside any hooks setup.
 
 ## Usage
 
