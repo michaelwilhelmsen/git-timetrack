@@ -67,6 +67,21 @@ def is_ignored(repo):
         return False
 
 
+def get_repo_name(cwd):
+    """Derive repo name from git remote origin URL, falling back to directory name."""
+    if not cwd:
+        return "unknown"
+    url = run(["git", "-C", cwd, "remote", "get-url", "origin"])
+    if url:
+        # Handle SSH (git@github.com:org/repo.git) and HTTPS (https://github.com/org/repo.git)
+        name = url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+        if name.endswith(".git"):
+            name = name[:-4]
+        if name:
+            return name
+    return os.path.basename(cwd)
+
+
 def ensure_data_dir():
     """Create data directory and default config files on first run."""
     DIR.mkdir(parents=True, exist_ok=True)
@@ -224,7 +239,7 @@ def main():
         return
 
     cwd = data.get("cwd", "")
-    repo = os.path.basename(cwd) if cwd else "unknown"
+    repo = get_repo_name(cwd)
 
     if is_ignored(repo):
         return
