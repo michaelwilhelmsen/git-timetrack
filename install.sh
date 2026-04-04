@@ -55,8 +55,32 @@ if [ "$1" = "--uninstall" ]; then
     fi
 
     if [ -f "$CLAUDE_SETTINGS" ] && grep -q "git-timetrack" "$CLAUDE_SETTINGS" 2>/dev/null; then
-        echo -e "\n  ${YELLOW}Note:${NC} Remove the git-timetrack hook entry from:"
-        echo -e "  ${DIM}$CLAUDE_SETTINGS${NC}"
+        python3 -c "
+import json, sys
+path = '$CLAUDE_SETTINGS'
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+    hooks = cfg.get('hooks', {})
+    for event_key in list(hooks.keys()):
+        entries = hooks[event_key]
+        if isinstance(entries, list):
+            hooks[event_key] = [
+                e for e in entries
+                if not (isinstance(e, dict) and 'git-timetrack' in json.dumps(e))
+            ]
+            if not hooks[event_key]:
+                del hooks[event_key]
+    if not hooks:
+        cfg.pop('hooks', None)
+    with open(path, 'w') as f:
+        json.dump(cfg, f, indent=2)
+        f.write('\n')
+    print('  \033[0;32m\u2713\033[0m Claude Code hook removed from settings.json')
+except Exception as ex:
+    print(f'  \033[1;33mNote:\033[0m Could not auto-clean {path}: {ex}', file=sys.stderr)
+    print(f'  \033[2mRemove the git-timetrack hook entry manually.\033[0m', file=sys.stderr)
+" 2>&1
     fi
 
     echo -e "\n${GREEN}Done.${NC}\n"
@@ -129,7 +153,7 @@ Accepts input two ways:
   - stdin JSON (Claude Code PostToolUse mode)
   - command-line args (git hook mode): hook-handler.py <event> [args...]
 """
-import json, sys, os, re, subprocess
+import json, sys, os, re, subprocess, fcntl
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -150,18 +174,29 @@ TRACKED = {
 def get_client(repo):
     if CLIENTS.exists():
         try: return json.loads(CLIENTS.read_text()).get(repo, "")
-        except: pass
+        except Exception: pass
     return ""
 
 def is_ignored(repo):
     if IGNORE.exists():
-        try: return repo in IGNORE.read_text().strip().split("\n")
-        except: pass
+        try:
+            lines = IGNORE.read_text().strip().split("\n")
+            return repo in [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
+        except Exception: pass
     return False
 
 def run(cmd):
-    try: return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, timeout=5).decode().strip()
-    except: return ""
+    try: return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+    except Exception: return ""
+
+def parse_diffstat(text):
+    stats = {"files_changed": 0, "insertions": 0, "deletions": 0}
+    for pat, key in [(r'(\d+)\s+files?\s+changed', 'files_changed'),
+                     (r'(\d+)\s+insertions?\(\+\)', 'insertions'),
+                     (r'(\d+)\s+deletions?\(-\)', 'deletions')]:
+        m = re.search(pat, text)
+        if m: stats[key] = int(m.group(1))
+    return stats
 
 def parse_git_output(out, event, cmd=""):
     info = {"commit_message":"","commit_hash":"","branch":"","files_changed":0,
@@ -173,20 +208,57 @@ def parse_git_output(out, event, cmd=""):
         if not info["commit_message"] and cmd:
             m2 = re.search(r'-m\s+["\'](.+?)["\']', cmd)
             if m2: info["commit_message"] = m2.group(1)
-        for pat, key in [(r'(\d+)\s+files?\s+changed','files_changed'),
-                         (r'(\d+)\s+insertions?\(\+\)','insertions'),
-                         (r'(\d+)\s+deletions?\(-\)','deletions')]:
-            m3 = re.search(pat, out)
-            if m3: info[key] = int(m3.group(1))
+        info.update(parse_diffstat(out))
     elif event == "checkout":
         m = re.search(r"Switched to (?:a new )?branch '([^']+)'", out)
         if m: info["new_branch"] = info["branch"] = m.group(1)
     return info
 
+DEDUP_WINDOW_SECS = 5
+
+def is_duplicate(entry):
+    """Check if the last logged entry is a duplicate (same event+repo+hash within DEDUP_WINDOW_SECS)."""
+    if not LOG.exists():
+        return False
+    try:
+        with open(LOG, "rb") as f:
+            f.seek(0, 2)
+            pos = f.tell()
+            if pos == 0:
+                return False
+            # Read backwards to find last newline
+            buf = b""
+            while pos > 0:
+                pos = max(pos - 256, 0)
+                f.seek(pos)
+                buf = f.read(f.tell() - pos if pos == 0 else 256) + buf
+                lines = buf.split(b"\n")
+                # Find last non-empty line
+                for line in reversed(lines):
+                    if line.strip():
+                        last = json.loads(line)
+                        if (last.get("event") == entry.get("event") and
+                            last.get("repo") == entry.get("repo") and
+                            last.get("commit_hash") == entry.get("commit_hash")):
+                            last_ts = datetime.strptime(last["timestamp"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                            entry_ts = datetime.strptime(entry["timestamp"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                            return abs((entry_ts - last_ts).total_seconds()) < DEDUP_WINDOW_SECS
+                        return False
+                break
+    except Exception:
+        pass
+    return False
+
 def log_entry(entry):
     DIR.mkdir(parents=True, exist_ok=True)
+    if is_duplicate(entry):
+        return
     with open(LOG, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(entry) + "\n")
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 def handle_claude_code():
     """Claude Code PostToolUse mode — reads JSON from stdin."""
@@ -220,10 +292,10 @@ def handle_git_hook():
     event = sys.argv[1] if len(sys.argv) > 1 else ""
     if event not in ("commit", "checkout", "merge"): return
 
-    repo = os.path.basename(run("git rev-parse --show-toplevel") or os.getcwd())
+    repo = os.path.basename(run(["git", "rev-parse", "--show-toplevel"]) or os.getcwd())
     if is_ignored(repo): return
 
-    branch = run("git rev-parse --abbrev-ref HEAD")
+    branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     entry = {
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "event": event, "repo": repo, "branch": branch,
@@ -234,20 +306,17 @@ def handle_git_hook():
     }
 
     if event == "commit":
-        entry["commit_hash"] = run("git rev-parse --short HEAD")
-        entry["commit_message"] = run("git log -1 --pretty=%s")
-        diffstat = run("git diff --shortstat HEAD~1 HEAD")
-        for pat, key in [(r'(\d+)\s+files?\s+changed','files_changed'),
-                         (r'(\d+)\s+insertions?\(\+\)','insertions'),
-                         (r'(\d+)\s+deletions?\(-\)','deletions')]:
-            m = re.search(pat, diffstat)
-            if m: entry[key] = int(m.group(1))
+        entry["commit_hash"] = run(["git", "rev-parse", "--short", "HEAD"])
+        entry["commit_message"] = run(["git", "log", "-1", "--pretty=%s"])
+        count = run(["git", "rev-list", "--count", "HEAD"])
+        if count == "1":
+            diffstat = run(["git", "diff", "--shortstat", "4b825dc642cb6eb9a060e54bf899d69f82e1764", "HEAD"])
+        else:
+            diffstat = run(["git", "diff", "--shortstat", "HEAD~1", "HEAD"])
+        entry.update(parse_diffstat(diffstat))
 
     elif event == "checkout":
         entry["new_branch"] = branch
-        prev = sys.argv[2] if len(sys.argv) > 2 else ""
-        if prev and len(prev) < 60:
-            entry["branch"] = prev
 
     log_entry(entry)
 
@@ -257,7 +326,7 @@ if __name__ == "__main__":
             handle_git_hook()
         else:
             handle_claude_code()
-    except:
+    except Exception:
         pass  # Never block, never fail loudly
 HANDLER_PY
 
@@ -293,7 +362,7 @@ case "$1" in
             existing="$(jq -r --arg r "$repo" '.[$r] // ""' "$MAP" 2>/dev/null)"
             if [ -z "$existing" ]; then
                 printf "  %s → which client? " "$repo"; read -r name
-                [ -n "$name" ] && tmp=$(mktemp) && jq --arg r "$repo" --arg c "$name" '. + {($r):$c}' "$MAP" > "$tmp" && mv "$tmp" "$MAP" && echo "  ✓ $repo → $name"
+                [ -n "$name" ] && tmp=$(mktemp) && { jq --arg r "$repo" --arg c "$name" '. + {($r):$c}' "$MAP" > "$tmp" && mv "$tmp" "$MAP" && echo "  ✓ $repo → $name" || rm -f "$tmp"; }
             else
                 echo "  $repo → $existing"
             fi
@@ -305,8 +374,7 @@ case "$1" in
         echo "       map-client --auto";;
     *)
         [ $# -lt 2 ] && echo "Usage: map-client <repo> \"Client Name\"" && exit 1
-        tmp=$(mktemp) && jq --arg r "$1" --arg c "$2" '. + {($r):$c}' "$MAP" > "$tmp" && mv "$tmp" "$MAP"
-        echo "✓ $1 → $2";;
+        tmp=$(mktemp) && { jq --arg r "$1" --arg c "$2" '. + {($r):$c}' "$MAP" > "$tmp" && mv "$tmp" "$MAP" && echo "✓ $1 → $2" || { rm -f "$tmp"; exit 1; }; };;
 esac
 MAPPER
 
@@ -318,121 +386,201 @@ cat > "$DIR/weeklog.sh" << 'WEEKLOG'
 set -e
 LOG="$HOME/.git-timetrack/activity.jsonl"
 MAP="$HOME/.git-timetrack/clients.json"
-FROM="$(date -d 'last monday' +%Y-%m-%d 2>/dev/null || date -v-monday +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)"
+FROM="$(python3 -c "from datetime import date,timedelta;d=date.today();print(d - timedelta(days=d.weekday()))")"
 TO="$(date +%Y-%m-%d)"; CF=""; DE=false; JO=false
+
+validate_date() {
+    if ! echo "$1" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+        echo "Error: Invalid date format '$1'. Expected YYYY-MM-DD." >&2; exit 1
+    fi
+    if ! python3 -c "from datetime import datetime; datetime.strptime('$1','%Y-%m-%d')" 2>/dev/null; then
+        echo "Error: Invalid date '$1'." >&2; exit 1
+    fi
+}
+
 while [[ $# -gt 0 ]]; do case $1 in
-    --from) FROM="$2";shift 2;; --to) TO="$2";shift 2;; --client) CF="$2";shift 2;;
+    --from) FROM="$2"; validate_date "$FROM"; shift 2;;
+    --to) TO="$2"; validate_date "$TO"; shift 2;;
+    --client) CF="$2";shift 2;;
     --draft-emails) DE=true;shift;; --json) JO=true;shift;;
     --help|-h) echo "Usage: weeklog [--from DATE] [--to DATE] [--client NAME] [--json] [--draft-emails]"; exit 0;;
     *) shift;; esac; done
 [ ! -f "$LOG" ] && echo "No activity yet. Make some commits first!" && exit 0
 
 exec python3 - "$FROM" "$TO" "$CF" "$DE" "$JO" << 'PY'
-import json,sys,os,re
-from datetime import datetime,timedelta
+import json, sys, os, re
+from datetime import datetime, timedelta
 from collections import defaultdict
 
-fd,td,cf,de,jo = sys.argv[1:6]
-cf=cf.lower(); de=de=="true"; jo=jo=="true"
-lf=os.path.expanduser("~/.git-timetrack/activity.jsonl")
-mf=os.path.expanduser("~/.git-timetrack/clients.json")
-cm=json.load(open(mf)) if os.path.exists(mf) else {}
+# ── Time estimation constants ───────────────────────────────
+CONTINUOUS_WORK_GAP_MIN = 120   # Max minutes between commits to count as continuous work
+DEFAULT_SESSION_MIN = 30        # Minutes assumed for an isolated commit or gap > threshold
+CHECKOUT_OVERHEAD_MIN = 5       # Minutes added per branch switch
+LINES_PER_HOUR = 50             # Lines changed per estimated hour (for single-commit repos)
 
-entries=[]
-for l in open(lf):
-    l=l.strip()
-    if l:
-        try: entries.append(json.loads(l))
-        except: pass
+# ── Parse arguments ─────────────────────────────────────────
+from_date_str, to_date_str, client_filter, draft_emails_str, json_output_str = sys.argv[1:6]
+client_filter = client_filter.lower()
+draft_emails = draft_emails_str == "true"
+json_output = json_output_str == "true"
 
-fd2=datetime.strptime(fd,"%Y-%m-%d")
-td2=datetime.strptime(td,"%Y-%m-%d")+timedelta(days=1)
+log_path = os.path.expanduser("~/.git-timetrack/activity.jsonl")
+map_path = os.path.expanduser("~/.git-timetrack/clients.json")
+client_map = json.load(open(map_path)) if os.path.exists(map_path) else {}
 
-fl=[]
-for e in entries:
+# ── Load and parse entries ──────────────────────────────────
+all_entries = []
+for line in open(log_path):
+    line = line.strip()
+    if line:
+        try:
+            all_entries.append(json.loads(line))
+        except Exception:
+            pass
+
+from_date = datetime.strptime(from_date_str, "%Y-%m-%d")
+to_date = datetime.strptime(to_date_str, "%Y-%m-%d") + timedelta(days=1)
+
+# ── Filter to date range and client ─────────────────────────
+filtered = []
+for entry in all_entries:
     try:
-        ts=datetime.strptime(e["timestamp"],"%Y-%m-%dT%H:%M:%SZ")
-        if fd2<=ts<td2:
-            r=e.get("repo","?"); c=e.get("client","") or cm.get(r,"")
-            e["_c"]=c or r; e["_t"]=ts
-            if cf and cf not in e["_c"].lower(): continue
-            fl.append(e)
-    except: pass
+        timestamp = datetime.strptime(entry["timestamp"], "%Y-%m-%dT%H:%M:%SZ")
+        if from_date <= timestamp < to_date:
+            repo = entry.get("repo", "?")
+            client = entry.get("client", "") or client_map.get(repo, "")
+            entry["_client"] = client or repo
+            entry["_time"] = timestamp
+            if client_filter and client_filter not in entry["_client"].lower():
+                continue
+            filtered.append(entry)
+    except Exception:
+        pass
 
-if not fl:
-    print(f"\nNo activity found for {fd} → {td}")
-    if cf: print(f"(filtered: {cf})")
+if not filtered:
+    print(f"\nNo activity found for {from_date_str} \u2192 {to_date_str}")
+    if client_filter:
+        print(f"(filtered: {client_filter})")
     sys.exit(0)
 
-bc=defaultdict(list)
-for e in sorted(fl, key=lambda x:x["_t"]):
-    bc[e["_c"]].append(e)
+# ── Group by client ─────────────────────────────────────────
+by_client = defaultdict(list)
+for entry in sorted(filtered, key=lambda x: x["_time"]):
+    by_client[entry["_client"]].append(entry)
 
-def est(ev):
-    co=[e for e in ev if e["event"]=="commit"]
-    if not co: return 0.0
-    if len(co)==1:
-        lines=co[0].get("insertions",0)+co[0].get("deletions",0)
-        return max(0.5,min(2.0,lines/50))
-    m=30
-    for i in range(1,len(co)):
-        g=(co[i]["_t"]-co[i-1]["_t"]).total_seconds()/60
-        m+=g if g<=120 else 30
-    m+=len([e for e in ev if e["event"]=="checkout"])*5
-    return round(m/60,1)
+def estimate_hours(events):
+    """Estimate work hours from commit patterns."""
+    commits = [e for e in events if e["event"] == "commit"]
+    if not commits:
+        return 0.0
+    # Single commit: estimate from diff size
+    if len(commits) == 1:
+        lines = commits[0].get("insertions", 0) + commits[0].get("deletions", 0)
+        return max(0.5, min(2.0, lines / LINES_PER_HOUR))
+    # Multiple commits: sum gaps (continuous if < threshold, else default session)
+    minutes = DEFAULT_SESSION_MIN
+    for i in range(1, len(commits)):
+        gap = (commits[i]["_time"] - commits[i - 1]["_time"]).total_seconds() / 60
+        minutes += gap if gap <= CONTINUOUS_WORK_GAP_MIN else DEFAULT_SESSION_MIN
+    # Add overhead for branch switches
+    minutes += len([e for e in events if e["event"] == "checkout"]) * CHECKOUT_OVERHEAD_MIN
+    return round(minutes / 60, 1)
 
-def clean(msg):
-    lb={"fix":"Fixed","feat":"Added","chore":"Updated","refactor":"Improved",
-        "docs":"Docs","perf":"Optimized","ci":"CI/CD","style":"Styled","test":"Tests"}
-    mx=re.match(r'^(fix|feat|chore|refactor|docs|style|test|perf|ci)(\(.+?\))?:\s*',msg)
-    if mx:
-        p=lb.get(mx.group(1),"Updated"); b=msg[mx.end():]
-        b=b[0].upper()+b[1:] if b else b; return f"{p}: {b}"
+def clean_message(msg):
+    """Translate conventional commit prefixes to business-friendly language."""
+    prefix_labels = {
+        "fix": "Fixed", "feat": "Added", "chore": "Updated", "refactor": "Improved",
+        "docs": "Docs", "perf": "Optimized", "ci": "CI/CD", "style": "Styled", "test": "Tests",
+    }
+    match = re.match(r'^(fix|feat|chore|refactor|docs|style|test|perf|ci)(\(.+?\))?:\s*', msg)
+    if match:
+        prefix = prefix_labels.get(match.group(1), "Updated")
+        body = msg[match.end():]
+        body = body[0].upper() + body[1:] if body else body
+        return f"{prefix}: {body}"
     return msg
 
-if jo:
-    r={}
-    for cl,ev in sorted(bc.items()):
-        co=[e for e in ev if e["event"]=="commit"]
-        br=sorted(set(e.get("branch","") for e in ev if e.get("branch","") and len(e.get("branch",""))<60))
-        r[cl]={"estimated_hours":est(ev),"branches":br,
-               "commits":[{"timestamp":e["timestamp"],"message":e.get("commit_message",""),
-                           "branch":e.get("branch",""),"files_changed":e.get("files_changed",0),
-                           "insertions":e.get("insertions",0),"deletions":e.get("deletions",0)}
-                          for e in co],
-               "context_switches":len([e for e in ev if e["event"]=="checkout"])}
-    print(json.dumps(r,indent=2)); sys.exit(0)
+# ── JSON output mode ────────────────────────────────────────
+if json_output:
+    result = {}
+    for client_name, events in sorted(by_client.items()):
+        commits = [e for e in events if e["event"] == "commit"]
+        branches = sorted(set(
+            e.get("branch", "") for e in events
+            if e.get("branch", "") and len(e.get("branch", "")) < 60
+        ))
+        result[client_name] = {
+            "estimated_hours": estimate_hours(events),
+            "branches": branches,
+            "commits": [{
+                "timestamp": e["timestamp"],
+                "message": e.get("commit_message", ""),
+                "branch": e.get("branch", ""),
+                "files_changed": e.get("files_changed", 0),
+                "insertions": e.get("insertions", 0),
+                "deletions": e.get("deletions", 0),
+            } for e in commits],
+            "context_switches": len([e for e in events if e["event"] == "checkout"]),
+        }
+    print(json.dumps(result, indent=2))
+    sys.exit(0)
 
-B="\033[1m";D="\033[2m";G="\033[0;32m";C="\033[0;36m";N="\033[0m"
-th=0
-print(f"\n{B}═══ Week Log: {fd} → {td} ═══{N}\n")
-for cl,ev in sorted(bc.items()):
-    h=est(ev); th+=h; co=[e for e in ev if e["event"]=="commit"]
-    print(f"{B}{cl}{N}  {D}(~{h} hrs){N}\n")
-    bd=defaultdict(list)
-    for c in co: bd[c["_t"].strftime("%a %d %b")].append(c)
-    for d,dc in bd.items():
-        print(f"  {C}{d}{N}")
-        for c in dc:
-            m=c.get("commit_message","?"); f=c.get("files_changed",0)
-            a=c.get("insertions",0); dl=c.get("deletions",0)
-            s=f"  {D}+{a}/-{dl} ({f} files){N}" if f else ""
-            print(f"    • {m}{s}")
+# ── Terminal output mode ────────────────────────────────────
+BOLD = "\033[1m"
+DIM = "\033[2m"
+GREEN = "\033[0;32m"
+CYAN = "\033[0;36m"
+RESET = "\033[0m"
+
+total_hours = 0
+separator = "\u2500" * 40
+print(f"\n{BOLD}\u2550\u2550\u2550 Week Log: {from_date_str} \u2192 {to_date_str} \u2550\u2550\u2550{RESET}\n")
+
+for client_name, events in sorted(by_client.items()):
+    hours = estimate_hours(events)
+    total_hours += hours
+    commits = [e for e in events if e["event"] == "commit"]
+    print(f"{BOLD}{client_name}{RESET}  {DIM}(~{hours} hrs){RESET}\n")
+
+    # Group commits by day
+    by_day = defaultdict(list)
+    for commit in commits:
+        by_day[commit["_time"].strftime("%a %d %b")].append(commit)
+
+    for day_label, day_commits in by_day.items():
+        print(f"  {CYAN}{day_label}{RESET}")
+        for commit in day_commits:
+            message = commit.get("commit_message", "?")
+            files = commit.get("files_changed", 0)
+            added = commit.get("insertions", 0)
+            deleted = commit.get("deletions", 0)
+            stats = f"  {DIM}+{added}/-{deleted} ({files} files){RESET}" if files else ""
+            print(f"    \u2022 {message}{stats}")
         print()
-    br=sorted(set(e.get("branch","") for e in ev if e.get("branch","") and len(e.get("branch",""))<60))
-    if br: print(f"  {D}Branches: {', '.join(br)}{N}\n")
-    if de and co:
-        print(f"  {G}📧 Draft email:{N}\n  {D}{'─'*40}{N}")
-        print(f"  Subject: Weekly update — {cl}\n\n  Hi,\n\n  Here's what we worked on this week:\n")
-        for c in co:
-            m=c.get("commit_message","")
-            if m: print(f"    • {clean(m)}")
-        print(f"\n  Estimated time: ~{h} hours\n\n  Let me know if you have any questions.")
-        print(f"  {D}{'─'*40}{N}\n")
-    print(f"  {'─'*40}\n")
-print(f"{B}Total: ~{th} hrs{N}")
-um=set(e.get("repo","") for e in fl)-set(cm.keys())
-if um: print(f"\n{D}💡 Unmapped repos: {', '.join(um)} → run: map-client --auto{N}")
+
+    branches = sorted(set(
+        e.get("branch", "") for e in events
+        if e.get("branch", "") and len(e.get("branch", "")) < 60
+    ))
+    if branches:
+        print(f"  {DIM}Branches: {', '.join(branches)}{RESET}\n")
+
+    if draft_emails and commits:
+        print(f"  {GREEN}\U0001f4e7 Draft email:{RESET}\n  {DIM}{separator}{RESET}")
+        print(f"  Subject: Weekly update \u2014 {client_name}\n\n  Hi,\n\n  Here's what we worked on this week:\n")
+        for commit in commits:
+            message = commit.get("commit_message", "")
+            if message:
+                print(f"    \u2022 {clean_message(message)}")
+        print(f"\n  Estimated time: ~{hours} hours\n\n  Let me know if you have any questions.")
+        print(f"  {DIM}{separator}{RESET}\n")
+
+    print(f"  {separator}\n")
+
+print(f"{BOLD}Total: ~{total_hours} hrs{RESET}")
+unmapped = set(e.get("repo", "") for e in filtered) - set(client_map.keys())
+if unmapped:
+    print(f"\n{DIM}\U0001f4a1 Unmapped repos: {', '.join(unmapped)} \u2192 run: map-client --auto{RESET}")
 print()
 PY
 WEEKLOG
@@ -568,6 +716,8 @@ GITHOOK
     else
         git config --global core.hooksPath "$HOOKS_DIR"
         echo -e "  ${GREEN}✓${NC} Global git hooks active"
+        echo -e "  ${YELLOW}⚠ Note:${NC} ${DIM}Per-repo hooks (.git/hooks, husky, pre-commit) won't run while${NC}"
+        echo -e "  ${DIM}  global core.hooksPath is set. See README FAQ for workarounds.${NC}"
     fi
 fi
 
