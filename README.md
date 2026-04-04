@@ -46,6 +46,20 @@ Claude translates `fix: MutationObserver feedback loop in cart widget` into `Fix
 
 You can have a conversation about it: _"Combine those first two bullets."_ _"Make it more formal."_ _"Skip the infrastructure stuff, the client doesn't care."_
 
+### Import past activity
+
+Just installed? Use `/import` to backfill your git history into the tracking log.
+
+```
+/import
+/import last 2 weeks
+/import /path/to/repo last month
+```
+
+Claude finds your repos, filters to your commits, and imports them — so `/timelog` can report on work done before the plugin was installed.
+
+> You can also use the full name `/git-timetrack:import`.
+
 ### Map projects to clients
 
 Use `/map-client` to associate repos with client names. Claude walks through your unmapped repos and suggests mappings.
