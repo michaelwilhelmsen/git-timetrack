@@ -14,13 +14,13 @@ Then on Friday, you run one command and get:
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USER/git-timetrack/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/michaelwilhelmsen/git-timetrack/main/install.sh | bash
 ```
 
 Or clone and run:
 
 ```bash
-git clone https://github.com/YOUR_USER/git-timetrack.git
+git clone https://github.com/michaelwilhelmsen/git-timetrack.git
 cd git-timetrack
 bash install.sh
 ```
@@ -113,10 +113,14 @@ Everything is stored locally in `~/.git-timetrack/activity.jsonl`. Nothing is se
   "repo": "acme-website",
   "branch": "main",
   "client": "Acme Corp",
+  "commit_hash": "a1b2c3d",
   "commit_message": "fix: resolve checkout page crash on mobile",
   "files_changed": 3,
   "insertions": 42,
-  "deletions": 7
+  "deletions": 7,
+  "new_branch": "",
+  "command": "git commit -m '...'",
+  "cwd": "/Users/you/projects/acme-website"
 }
 ```
 
@@ -144,7 +148,7 @@ No. Everything stays in `~/.git-timetrack/` on your machine. The `/weeklog` slas
 Each person installs it locally. There's no shared server. If you want to aggregate, you could collect the JSON files, but that's a build-your-own situation for now.
 
 **Will this slow down my commits?**
-The hook runs in the background (`&`) and typically finishes in <50ms. You won't notice it.
+Post-checkout and post-merge hooks run in the background (`&`). Post-commit runs synchronously to capture HEAD before anything else changes, but typically finishes in <50ms. You won't notice it.
 
 **What about repos I don't want tracked?**
 The git hooks mode tracks all repos. You can add a `~/.git-timetrack/ignore` file (one repo name per line) — the handler respects it. (Claude Code mode only tracks what Claude does, so it's naturally scoped.)
@@ -156,7 +160,7 @@ bash install.sh --uninstall
 
 ## Contributing
 
-Issues and PRs welcome. The codebase is intentionally small — the core handler is ~60 lines of Python, the weeklog is a single bash/python script. Keep it simple.
+Issues and PRs welcome. The entire tool is a single installer script. Keep it simple.
 
 ## License
 

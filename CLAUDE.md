@@ -12,7 +12,7 @@ This is an **installer-based project** — there is no traditional build system.
 
 | Generated file | Purpose |
 |---|---|
-| `~/.git-timetrack/hook-handler.py` | Central event processor (~60 lines Python) |
+| `~/.git-timetrack/hook-handler.py` | Central event processor (Python) |
 | `~/.git-timetrack/weeklog.sh` | Terminal summarizer (bash + embedded Python) |
 | `~/.git-timetrack/map-client.sh` | Interactive repo→client mapping CLI |
 | `~/.claude/commands/weeklog.md` | Claude Code slash command |
