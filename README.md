@@ -20,8 +20,8 @@ Then you ask Claude, and get:
 ## Install
 
 ```
-/plugin marketplace add michaelwilhelmsen/claude-plugins
-/plugin install git-timetrack@claude-plugins
+/plugin marketplace add michaelwilhelmsen/git-timetrack
+/plugin install git-timetrack@git-timetrack
 ```
 
 That's it. The plugin hooks into your git commands automatically — no configuration needed.
@@ -115,7 +115,7 @@ Add the repo name to `~/.git-timetrack/ignore` (one per line). The handler check
 
 **How do I uninstall?**
 ```
-/plugin uninstall git-timetrack@claude-plugins
+/plugin uninstall git-timetrack@git-timetrack
 ```
 Your activity data in `~/.git-timetrack/` is preserved. Delete it manually if you want.
 
