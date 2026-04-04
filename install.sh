@@ -11,7 +11,6 @@ set -e
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-RED='\033[0;31m'
 DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
@@ -188,16 +187,11 @@ IGNORE  = DIR / "ignore"
 
 EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf899d69f82e1764"
 DEDUP_WINDOW_SECS = 5
+TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
-# Regex patterns for git commands we care about
-TRACKED_COMMANDS = {
-    "commit":   re.compile(r"\bgit\s+commit\b"),
-    "push":     re.compile(r"\bgit\s+push\b"),
-    "checkout": re.compile(r"\bgit\s+(checkout|switch)\b"),
-    "merge":    re.compile(r"\bgit\s+merge\b"),
-    "pull":     re.compile(r"\bgit\s+pull\b"),
-    "rebase":   re.compile(r"\bgit\s+rebase\b"),
-}
+TRACKED_COMMANDS = ["commit", "push", "checkout", "switch", "merge", "pull", "rebase"]
+# Events the global git hooks can fire (subset of TRACKED_COMMANDS)
+GIT_HOOK_EVENTS = ("commit", "checkout", "merge")
 
 # ── Utility functions ───────────────────────────────────────
 
@@ -254,39 +248,33 @@ def parse_diffstat(text):
     return stats
 
 
-def parse_git_output(output, event, cmd=""):
-    """Parse git command output to extract commit/checkout metadata."""
-    info = {
-        "commit_message": "",
-        "commit_hash": "",
-        "branch": "",
-        "files_changed": 0,
-        "insertions": 0,
-        "deletions": 0,
-        "new_branch": "",
-    }
+def detect_git_command(cmd):
+    """Detect which tracked git command is in the string. Returns event name or None.
+    Normalizes 'git switch' to 'checkout'."""
+    normalized = re.sub(r"\s+", " ", cmd)
+    for name in TRACKED_COMMANDS:
+        if f"git {name}" in normalized:
+            return "checkout" if name == "switch" else name
+    return None
+
+
+def gather_git_state(event, cwd):
+    """Gather current git state by running git commands in cwd. Shared by both handlers."""
+    def git(*args):
+        return run(["git", "-C", cwd] + list(args)) if cwd else run(["git"] + list(args))
+
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    info = {"branch": branch, "commit_hash": "", "commit_message": "",
+            "files_changed": 0, "insertions": 0, "deletions": 0, "new_branch": ""}
 
     if event == "commit":
-        # Try to extract from git's output: "[branch hash] message"
-        match = re.search(r"\[(\S+)\s+(\w+)\]\s+(.+)", output)
-        if match:
-            info["branch"] = match.group(1)
-            info["commit_hash"] = match.group(2)
-            info["commit_message"] = match.group(3)
-
-        # Fall back to extracting -m "message" from the command itself
-        if not info["commit_message"] and cmd:
-            msg_match = re.search(r"""-m\s+['"](.+?)['"]""", cmd)
-            if msg_match:
-                info["commit_message"] = msg_match.group(1)
-
-        info.update(parse_diffstat(output))
-
+        info["commit_hash"] = git("rev-parse", "--short", "HEAD")
+        info["commit_message"] = git("log", "-1", "--pretty=%s")
+        # Use empty tree for initial commits (rev-parse HEAD~1 fails)
+        parent = "HEAD~1" if git("rev-parse", "HEAD~1") else EMPTY_TREE_SHA
+        info.update(parse_diffstat(git("diff", "--shortstat", parent, "HEAD")))
     elif event == "checkout":
-        match = re.search(r"Switched to (?:a new )?branch '([^']+)'", output)
-        if match:
-            info["new_branch"] = match.group(1)
-            info["branch"] = match.group(1)
+        info["new_branch"] = branch
 
     return info
 
@@ -333,9 +321,8 @@ def is_duplicate(entry):
 
     # Same event — check if timestamps are within the dedup window
     try:
-        fmt = "%Y-%m-%dT%H:%M:%SZ"
-        last_ts = datetime.strptime(last["timestamp"], fmt).replace(tzinfo=timezone.utc)
-        entry_ts = datetime.strptime(entry["timestamp"], fmt).replace(tzinfo=timezone.utc)
+        last_ts = datetime.strptime(last["timestamp"], TIMESTAMP_FMT).replace(tzinfo=timezone.utc)
+        entry_ts = datetime.strptime(entry["timestamp"], TIMESTAMP_FMT).replace(tzinfo=timezone.utc)
         return abs((entry_ts - last_ts).total_seconds()) < DEDUP_WINDOW_SECS
     except Exception:
         return False
@@ -345,29 +332,27 @@ def log_entry(entry):
     """Append an entry to the activity log (with file locking and dedup)."""
     DIR.mkdir(parents=True, exist_ok=True)
 
-    if is_duplicate(entry):
-        return
-
     with open(LOG, "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
-            f.write(json.dumps(entry) + "\n")
+            if not is_duplicate(entry):
+                f.write(json.dumps(entry) + "\n")
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
 
 # ── Entry builders ──────────────────────────────────────────
 
 def make_timestamp():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime(TIMESTAMP_FMT)
 
 
-def make_entry(event, repo, branch, **extra):
+def make_entry(event, repo, **extra):
     """Build a base log entry dict with common fields."""
     entry = {
         "timestamp": make_timestamp(),
         "event": event,
         "repo": repo,
-        "branch": branch,
+        "branch": "",
         "client": get_client(repo),
         "commit_hash": "",
         "commit_message": "",
@@ -391,71 +376,41 @@ def handle_claude_code():
     cmd = data.get("tool_input", {}).get("command", "")
 
     # Check if it's a git command we track
-    event = None
-    for name, pattern in TRACKED_COMMANDS.items():
-        if pattern.search(cmd):
-            event = name
-            break
+    event = detect_git_command(cmd)
     if not event:
         return
 
-    # Extract output and working directory
-    out = data.get("tool_output", {})
-    combined = f"{out.get('stdout', '')}\n{out.get('stderr', '')}"
-    cwd = data.get("session_cwd", data.get("cwd", ""))
+    # Extract working directory
+    cwd = data.get("cwd", "")
     repo = os.path.basename(cwd) if cwd else "unknown"
 
     if is_ignored(repo):
         return
 
-    # Parse the git output and log the event
-    info = parse_git_output(combined, event, cmd)
-    log_entry(make_entry(
-        event, repo, info["branch"],
-        commit_hash=info["commit_hash"],
-        commit_message=info["commit_message"],
-        files_changed=info["files_changed"],
-        insertions=info["insertions"],
-        deletions=info["deletions"],
-        new_branch=info["new_branch"],
-        command=cmd,
-        cwd=cwd,
-    ))
+    # Gather git state by running commands (same approach as git hook handler)
+    info = gather_git_state(event, cwd)
+    log_entry(make_entry(event, repo, command=cmd, cwd=cwd, **info))
 
 
 def handle_git_hook():
     """Global git hook mode — called with event type as arg."""
     event = sys.argv[1] if len(sys.argv) > 1 else ""
-    if event not in ("commit", "checkout", "merge"):
+    if event not in GIT_HOOK_EVENTS:
         return
 
-    repo = os.path.basename(run(["git", "rev-parse", "--show-toplevel"]) or os.getcwd())
+    cwd = run(["git", "rev-parse", "--show-toplevel"]) or os.getcwd()
+    repo = os.path.basename(cwd)
     if is_ignored(repo):
         return
 
-    branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-    entry = make_entry(event, repo, branch, cwd=os.getcwd())
-
-    if event == "commit":
-        entry["commit_hash"] = run(["git", "rev-parse", "--short", "HEAD"])
-        entry["commit_message"] = run(["git", "log", "-1", "--pretty=%s"])
-
-        # Use empty tree for initial commits (no HEAD~1 available)
-        count = run(["git", "rev-list", "--count", "HEAD"])
-        parent = EMPTY_TREE_SHA if count == "1" else "HEAD~1"
-        diffstat = run(["git", "diff", "--shortstat", parent, "HEAD"])
-        entry.update(parse_diffstat(diffstat))
-
-    elif event == "checkout":
-        entry["new_branch"] = branch
-
-    log_entry(entry)
+    info = gather_git_state(event, cwd)
+    log_entry(make_entry(event, repo, cwd=cwd, **info))
 
 # ── Main ────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) > 1 and sys.argv[1] in ("commit", "checkout", "merge"):
+        if len(sys.argv) > 1 and sys.argv[1] in GIT_HOOK_EVENTS:
             handle_git_hook()
         else:
             handle_claude_code()
@@ -633,17 +588,22 @@ json_output = json_output_str == "true"
 
 log_path = os.path.expanduser("~/.git-timetrack/activity.jsonl")
 map_path = os.path.expanduser("~/.git-timetrack/clients.json")
-client_map = json.load(open(map_path)) if os.path.exists(map_path) else {}
+client_map = {}
+if os.path.exists(map_path):
+    with open(map_path) as f:
+        client_map = json.load(f)
 
 # ── Load and parse entries ──────────────────────────────────
 all_entries = []
-for line in open(log_path):
-    line = line.strip()
-    if line:
-        try:
-            all_entries.append(json.loads(line))
-        except Exception:
-            pass
+if os.path.exists(log_path):
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    all_entries.append(json.loads(line))
+                except Exception:
+                    pass
 
 from_date = datetime.strptime(from_date_str, "%Y-%m-%d")
 to_date = datetime.strptime(to_date_str, "%Y-%m-%d") + timedelta(days=1)
@@ -860,7 +820,8 @@ SLASHCMD
           {
             "type": "command",
             "if": "Bash(git *)",
-            "command": "python3 \"$HOME/.git-timetrack/hook-handler.py\""
+            "command": "python3 \"$HOME/.git-timetrack/hook-handler.py\"",
+            "timeout": 30
           }
         ]
       }
@@ -881,7 +842,8 @@ HOOKJSON
         echo '      "hooks": [{'
         echo '        "type": "command",'
         echo '        "if": "Bash(git *)",'
-        echo '        "command": "python3 \"$HOME/.git-timetrack/hook-handler.py\""'
+        echo '        "command": "python3 \"$HOME/.git-timetrack/hook-handler.py\"",'
+        echo '        "timeout": 30'
         echo '      }]'
         echo '    }'
         echo ""
