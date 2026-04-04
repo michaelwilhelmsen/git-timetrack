@@ -30,15 +30,17 @@ That's it. The plugin hooks into your git commands automatically — no configur
 
 ### Time reports
 
-Use `/git-timetrack:timelog` to summarize your activity. Claude reads your git history and writes human-friendly reports.
+Use `/timelog` to summarize your activity. Claude reads your git history and writes human-friendly reports.
 
 ```
-/git-timetrack:timelog
-/git-timetrack:timelog today
-/git-timetrack:timelog this week for acme
-/git-timetrack:timelog last month, invoice format
-/git-timetrack:timelog in german, professional tone
+/timelog
+/timelog today
+/timelog this week for acme
+/timelog last month, invoice format
+/timelog in german, professional tone
 ```
+
+> You can also use the full name `/git-timetrack:timelog`.
 
 Claude translates `fix: MutationObserver feedback loop in cart widget` into `Fixed an issue where the shopping cart wasn't updating correctly` — and writes a complete email draft you can review and send.
 
@@ -46,12 +48,14 @@ You can have a conversation about it: _"Combine those first two bullets."_ _"Mak
 
 ### Map projects to clients
 
-Use `/git-timetrack:map-client` to associate repos with client names. Claude walks through your unmapped repos and suggests mappings.
+Use `/map-client` to associate repos with client names. Claude walks through your unmapped repos and suggests mappings.
 
 ```
-/git-timetrack:map-client
-/git-timetrack:map-client my-repo "Acme Corp"
+/map-client
+/map-client my-repo "Acme Corp"
 ```
+
+> You can also use the full name `/git-timetrack:map-client`.
 
 ## How time estimation works
 
