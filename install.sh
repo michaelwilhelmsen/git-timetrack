@@ -55,32 +55,45 @@ if [ "$1" = "--uninstall" ]; then
     fi
 
     if [ -f "$CLAUDE_SETTINGS" ] && grep -q "git-timetrack" "$CLAUDE_SETTINGS" 2>/dev/null; then
-        python3 -c "
+        python3 << CLEANUP_PY
 import json, sys
-path = '$CLAUDE_SETTINGS'
+
+path = "$CLAUDE_SETTINGS"
+GREEN = "\033[0;32m"
+YELLOW = "\033[1;33m"
+DIM = "\033[2m"
+NC = "\033[0m"
+
 try:
     with open(path) as f:
-        cfg = json.load(f)
-    hooks = cfg.get('hooks', {})
+        config = json.load(f)
+
+    # Remove any hook entries that reference git-timetrack
+    hooks = config.get("hooks", {})
     for event_key in list(hooks.keys()):
         entries = hooks[event_key]
         if isinstance(entries, list):
             hooks[event_key] = [
-                e for e in entries
-                if not (isinstance(e, dict) and 'git-timetrack' in json.dumps(e))
+                entry for entry in entries
+                if not (isinstance(entry, dict) and "git-timetrack" in json.dumps(entry))
             ]
             if not hooks[event_key]:
                 del hooks[event_key]
+
+    # Remove the hooks key entirely if empty
     if not hooks:
-        cfg.pop('hooks', None)
-    with open(path, 'w') as f:
-        json.dump(cfg, f, indent=2)
-        f.write('\n')
-    print('  \033[0;32m\u2713\033[0m Claude Code hook removed from settings.json')
+        config.pop("hooks", None)
+
+    with open(path, "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\\n")
+
+    print(f"  {GREEN}\\u2713{NC} Claude Code hook removed from settings.json")
+
 except Exception as ex:
-    print(f'  \033[1;33mNote:\033[0m Could not auto-clean {path}: {ex}', file=sys.stderr)
-    print(f'  \033[2mRemove the git-timetrack hook entry manually.\033[0m', file=sys.stderr)
-" 2>&1
+    print(f"  {YELLOW}Note:{NC} Could not auto-clean {path}: {ex}", file=sys.stderr)
+    print(f"  {DIM}Remove the git-timetrack hook entry manually.{NC}", file=sys.stderr)
+CLEANUP_PY
     fi
 
     echo -e "\n${GREEN}Done.${NC}\n"
@@ -149,110 +162,192 @@ cat > "$DIR/hook-handler.py" << 'HANDLER_PY'
 #!/usr/bin/env python3
 """
 git-timetrack hook handler.
+
 Accepts input two ways:
-  - stdin JSON (Claude Code PostToolUse mode)
-  - command-line args (git hook mode): hook-handler.py <event> [args...]
+  - stdin JSON  → Claude Code PostToolUse mode
+  - CLI args    → git hook mode: hook-handler.py <event> [args...]
 """
-import json, sys, os, re, subprocess, fcntl
+
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-DIR = Path.home() / ".git-timetrack"
-LOG = DIR / "activity.jsonl"
+# ── Paths ───────────────────────────────────────────────────
+
+DIR     = Path.home() / ".git-timetrack"
+LOG     = DIR / "activity.jsonl"
 CLIENTS = DIR / "clients.json"
-IGNORE = DIR / "ignore"
+IGNORE  = DIR / "ignore"
 
-TRACKED = {
-    "commit": re.compile(r'\bgit\s+commit\b'),
-    "push": re.compile(r'\bgit\s+push\b'),
-    "checkout": re.compile(r'\bgit\s+(checkout|switch)\b'),
-    "merge": re.compile(r'\bgit\s+merge\b'),
-    "pull": re.compile(r'\bgit\s+pull\b'),
-    "rebase": re.compile(r'\bgit\s+rebase\b'),
-}
+# ── Constants ───────────────────────────────────────────────
 
-def get_client(repo):
-    if CLIENTS.exists():
-        try: return json.loads(CLIENTS.read_text()).get(repo, "")
-        except Exception: pass
-    return ""
-
-def is_ignored(repo):
-    if IGNORE.exists():
-        try:
-            lines = IGNORE.read_text().strip().split("\n")
-            return repo in [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
-        except Exception: pass
-    return False
-
-def run(cmd):
-    try: return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=5).decode().strip()
-    except Exception: return ""
-
-def parse_diffstat(text):
-    stats = {"files_changed": 0, "insertions": 0, "deletions": 0}
-    for pat, key in [(r'(\d+)\s+files?\s+changed', 'files_changed'),
-                     (r'(\d+)\s+insertions?\(\+\)', 'insertions'),
-                     (r'(\d+)\s+deletions?\(-\)', 'deletions')]:
-        m = re.search(pat, text)
-        if m: stats[key] = int(m.group(1))
-    return stats
-
-def parse_git_output(out, event, cmd=""):
-    info = {"commit_message":"","commit_hash":"","branch":"","files_changed":0,
-            "insertions":0,"deletions":0,"new_branch":""}
-    if event == "commit":
-        m = re.search(r'\[(\S+)\s+(\w+)\]\s+(.+)', out)
-        if m:
-            info["branch"], info["commit_hash"], info["commit_message"] = m.group(1), m.group(2), m.group(3)
-        if not info["commit_message"] and cmd:
-            m2 = re.search(r'-m\s+["\'](.+?)["\']', cmd)
-            if m2: info["commit_message"] = m2.group(1)
-        info.update(parse_diffstat(out))
-    elif event == "checkout":
-        m = re.search(r"Switched to (?:a new )?branch '([^']+)'", out)
-        if m: info["new_branch"] = info["branch"] = m.group(1)
-    return info
-
+EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf899d69f82e1764"
 DEDUP_WINDOW_SECS = 5
 
-def is_duplicate(entry):
-    """Check if the last logged entry is a duplicate (same event+repo+hash within DEDUP_WINDOW_SECS)."""
-    if not LOG.exists():
+# Regex patterns for git commands we care about
+TRACKED_COMMANDS = {
+    "commit":   re.compile(r"\bgit\s+commit\b"),
+    "push":     re.compile(r"\bgit\s+push\b"),
+    "checkout": re.compile(r"\bgit\s+(checkout|switch)\b"),
+    "merge":    re.compile(r"\bgit\s+merge\b"),
+    "pull":     re.compile(r"\bgit\s+pull\b"),
+    "rebase":   re.compile(r"\bgit\s+rebase\b"),
+}
+
+# ── Utility functions ───────────────────────────────────────
+
+def run(cmd):
+    """Run a command and return its stdout, or empty string on failure."""
+    try:
+        output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=5)
+        return output.decode().strip()
+    except Exception:
+        return ""
+
+
+def get_client(repo):
+    """Look up the client name for a repo from clients.json."""
+    if not CLIENTS.exists():
+        return ""
+    try:
+        mapping = json.loads(CLIENTS.read_text())
+        return mapping.get(repo, "")
+    except Exception:
+        return ""
+
+
+def is_ignored(repo):
+    """Check if a repo is listed in the ignore file (skipping comments and blanks)."""
+    if not IGNORE.exists():
         return False
     try:
+        lines = IGNORE.read_text().strip().split("\n")
+        ignored_repos = [
+            line.strip() for line in lines
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        return repo in ignored_repos
+    except Exception:
+        return False
+
+# ── Parsing helpers ─────────────────────────────────────────
+
+DIFFSTAT_PATTERNS = [
+    (r"(\d+)\s+files?\s+changed",    "files_changed"),
+    (r"(\d+)\s+insertions?\(\+\)",   "insertions"),
+    (r"(\d+)\s+deletions?\(-\)",     "deletions"),
+]
+
+
+def parse_diffstat(text):
+    """Extract files_changed, insertions, deletions from git's --shortstat output."""
+    stats = {"files_changed": 0, "insertions": 0, "deletions": 0}
+    for pattern, key in DIFFSTAT_PATTERNS:
+        match = re.search(pattern, text)
+        if match:
+            stats[key] = int(match.group(1))
+    return stats
+
+
+def parse_git_output(output, event, cmd=""):
+    """Parse git command output to extract commit/checkout metadata."""
+    info = {
+        "commit_message": "",
+        "commit_hash": "",
+        "branch": "",
+        "files_changed": 0,
+        "insertions": 0,
+        "deletions": 0,
+        "new_branch": "",
+    }
+
+    if event == "commit":
+        # Try to extract from git's output: "[branch hash] message"
+        match = re.search(r"\[(\S+)\s+(\w+)\]\s+(.+)", output)
+        if match:
+            info["branch"] = match.group(1)
+            info["commit_hash"] = match.group(2)
+            info["commit_message"] = match.group(3)
+
+        # Fall back to extracting -m "message" from the command itself
+        if not info["commit_message"] and cmd:
+            msg_match = re.search(r"""-m\s+['"](.+?)['"]""", cmd)
+            if msg_match:
+                info["commit_message"] = msg_match.group(1)
+
+        info.update(parse_diffstat(output))
+
+    elif event == "checkout":
+        match = re.search(r"Switched to (?:a new )?branch '([^']+)'", output)
+        if match:
+            info["new_branch"] = match.group(1)
+            info["branch"] = match.group(1)
+
+    return info
+
+# ── Logging ─────────────────────────────────────────────────
+
+def read_last_entry():
+    """Read the last JSON entry from the activity log, or None."""
+    if not LOG.exists():
+        return None
+    try:
         with open(LOG, "rb") as f:
+            # Seek to end, read the last 512 bytes (enough for one entry)
             f.seek(0, 2)
-            pos = f.tell()
-            if pos == 0:
-                return False
-            # Read backwards to find last newline
-            buf = b""
-            while pos > 0:
-                pos = max(pos - 256, 0)
-                f.seek(pos)
-                buf = f.read(f.tell() - pos if pos == 0 else 256) + buf
-                lines = buf.split(b"\n")
-                # Find last non-empty line
-                for line in reversed(lines):
-                    if line.strip():
-                        last = json.loads(line)
-                        if (last.get("event") == entry.get("event") and
-                            last.get("repo") == entry.get("repo") and
-                            last.get("commit_hash") == entry.get("commit_hash")):
-                            last_ts = datetime.strptime(last["timestamp"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                            entry_ts = datetime.strptime(entry["timestamp"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                            return abs((entry_ts - last_ts).total_seconds()) < DEDUP_WINDOW_SECS
-                        return False
-                break
+            size = f.tell()
+            if size == 0:
+                return None
+            f.seek(max(0, size - 512))
+            tail = f.read().decode("utf-8", errors="replace")
+
+        # Grab the last non-empty line
+        for line in reversed(tail.strip().split("\n")):
+            if line.strip():
+                return json.loads(line)
     except Exception:
         pass
-    return False
+    return None
+
+
+def is_duplicate(entry):
+    """Check if the entry duplicates the last log line (same event+repo+hash within a few seconds).
+
+    This prevents double-logging when both Claude Code hooks and global git hooks
+    are active simultaneously.
+    """
+    last = read_last_entry()
+    if last is None:
+        return False
+
+    # Different event, repo, or commit hash → not a duplicate
+    if (last.get("event") != entry.get("event") or
+            last.get("repo") != entry.get("repo") or
+            last.get("commit_hash") != entry.get("commit_hash")):
+        return False
+
+    # Same event — check if timestamps are within the dedup window
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        last_ts = datetime.strptime(last["timestamp"], fmt).replace(tzinfo=timezone.utc)
+        entry_ts = datetime.strptime(entry["timestamp"], fmt).replace(tzinfo=timezone.utc)
+        return abs((entry_ts - last_ts).total_seconds()) < DEDUP_WINDOW_SECS
+    except Exception:
+        return False
+
 
 def log_entry(entry):
+    """Append an entry to the activity log (with file locking and dedup)."""
     DIR.mkdir(parents=True, exist_ok=True)
+
     if is_duplicate(entry):
         return
+
     with open(LOG, "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
@@ -260,65 +355,103 @@ def log_entry(entry):
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
 
+# ── Entry builders ──────────────────────────────────────────
+
+def make_timestamp():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def make_entry(event, repo, branch, **extra):
+    """Build a base log entry dict with common fields."""
+    entry = {
+        "timestamp": make_timestamp(),
+        "event": event,
+        "repo": repo,
+        "branch": branch,
+        "client": get_client(repo),
+        "commit_hash": "",
+        "commit_message": "",
+        "files_changed": 0,
+        "insertions": 0,
+        "deletions": 0,
+        "new_branch": "",
+        "command": "",
+        "cwd": "",
+    }
+    entry.update(extra)
+    return entry
+
+# ── Handlers ────────────────────────────────────────────────
+
 def handle_claude_code():
     """Claude Code PostToolUse mode — reads JSON from stdin."""
     data = json.loads(sys.stdin.read())
-    cmd = data.get("tool_input", {}).get("command", "")
-    event = None
-    for name, pat in TRACKED.items():
-        if pat.search(cmd):
-            event = name; break
-    if not event: return
 
+    # Extract the command that was run
+    cmd = data.get("tool_input", {}).get("command", "")
+
+    # Check if it's a git command we track
+    event = None
+    for name, pattern in TRACKED_COMMANDS.items():
+        if pattern.search(cmd):
+            event = name
+            break
+    if not event:
+        return
+
+    # Extract output and working directory
     out = data.get("tool_output", {})
     combined = f"{out.get('stdout', '')}\n{out.get('stderr', '')}"
     cwd = data.get("session_cwd", data.get("cwd", ""))
     repo = os.path.basename(cwd) if cwd else "unknown"
 
-    if is_ignored(repo): return
+    if is_ignored(repo):
+        return
 
+    # Parse the git output and log the event
     info = parse_git_output(combined, event, cmd)
-    log_entry({
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "event": event, "repo": repo, "branch": info["branch"],
-        "client": get_client(repo), "commit_hash": info["commit_hash"],
-        "commit_message": info["commit_message"], "files_changed": info["files_changed"],
-        "insertions": info["insertions"], "deletions": info["deletions"],
-        "new_branch": info["new_branch"], "command": cmd, "cwd": cwd,
-    })
+    log_entry(make_entry(
+        event, repo, info["branch"],
+        commit_hash=info["commit_hash"],
+        commit_message=info["commit_message"],
+        files_changed=info["files_changed"],
+        insertions=info["insertions"],
+        deletions=info["deletions"],
+        new_branch=info["new_branch"],
+        command=cmd,
+        cwd=cwd,
+    ))
+
 
 def handle_git_hook():
     """Global git hook mode — called with event type as arg."""
     event = sys.argv[1] if len(sys.argv) > 1 else ""
-    if event not in ("commit", "checkout", "merge"): return
+    if event not in ("commit", "checkout", "merge"):
+        return
 
     repo = os.path.basename(run(["git", "rev-parse", "--show-toplevel"]) or os.getcwd())
-    if is_ignored(repo): return
+    if is_ignored(repo):
+        return
 
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-    entry = {
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "event": event, "repo": repo, "branch": branch,
-        "client": get_client(repo),
-        "commit_hash": "", "commit_message": "", "files_changed": 0,
-        "insertions": 0, "deletions": 0, "new_branch": "", "command": "",
-        "cwd": os.getcwd(),
-    }
+    entry = make_entry(event, repo, branch, cwd=os.getcwd())
 
     if event == "commit":
         entry["commit_hash"] = run(["git", "rev-parse", "--short", "HEAD"])
         entry["commit_message"] = run(["git", "log", "-1", "--pretty=%s"])
+
+        # Use empty tree for initial commits (no HEAD~1 available)
         count = run(["git", "rev-list", "--count", "HEAD"])
-        if count == "1":
-            diffstat = run(["git", "diff", "--shortstat", "4b825dc642cb6eb9a060e54bf899d69f82e1764", "HEAD"])
-        else:
-            diffstat = run(["git", "diff", "--shortstat", "HEAD~1", "HEAD"])
+        parent = EMPTY_TREE_SHA if count == "1" else "HEAD~1"
+        diffstat = run(["git", "diff", "--shortstat", parent, "HEAD"])
         entry.update(parse_diffstat(diffstat))
 
     elif event == "checkout":
         entry["new_branch"] = branch
 
     log_entry(entry)
+
+# ── Main ────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     try:
@@ -327,7 +460,7 @@ if __name__ == "__main__":
         else:
             handle_claude_code()
     except Exception:
-        pass  # Never block, never fail loudly
+        pass  # Never block git operations, never fail loudly
 HANDLER_PY
 
 echo -e "  ${GREEN}✓${NC} Hook handler installed"
@@ -347,34 +480,69 @@ fi
 
 cat > "$DIR/map-client.sh" << 'MAPPER'
 #!/usr/bin/env bash
+# map-client — map git repos to client names for time tracking
 set -e
+
 MAP="$HOME/.git-timetrack/clients.json"
 LOG="$HOME/.git-timetrack/activity.jsonl"
+
+# Ensure the mapping file exists
 [ ! -f "$MAP" ] && echo '{}' > "$MAP"
+
+# ── Helper: safely update the JSON map ──────────────────────
+
+update_map() {
+    local repo="$1" client="$2"
+    local tmp
+    tmp=$(mktemp)
+    if jq --arg r "$repo" --arg c "$client" '. + {($r):$c}' "$MAP" > "$tmp"; then
+        mv "$tmp" "$MAP"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# ── Commands ────────────────────────────────────────────────
 
 case "$1" in
     --list)
-        echo ""; jq -r 'to_entries[] | "  \(.key) → \(.value)"' "$MAP" 2>/dev/null || cat "$MAP"; echo "";;
+        echo ""
+        jq -r 'to_entries[] | "  \(.key) → \(.value)"' "$MAP" 2>/dev/null || cat "$MAP"
+        echo ""
+        ;;
+
     --auto)
         [ ! -f "$LOG" ] && echo "No activity yet. Make some commits first!" && exit 0
         echo ""
         while IFS= read -r repo; do
             existing="$(jq -r --arg r "$repo" '.[$r] // ""' "$MAP" 2>/dev/null)"
             if [ -z "$existing" ]; then
-                printf "  %s → which client? " "$repo"; read -r name
-                [ -n "$name" ] && tmp=$(mktemp) && { jq --arg r "$repo" --arg c "$name" '. + {($r):$c}' "$MAP" > "$tmp" && mv "$tmp" "$MAP" && echo "  ✓ $repo → $name" || rm -f "$tmp"; }
+                printf "  %s → which client? " "$repo"
+                read -r name
+                if [ -n "$name" ]; then
+                    update_map "$repo" "$name" && echo "  ✓ $repo → $name"
+                fi
             else
                 echo "  $repo → $existing"
             fi
         done < <(jq -r '.repo' "$LOG" 2>/dev/null | sort -u)
-        echo "";;
-    ""|--help|-h)
+        echo ""
+        ;;
+
+    "" | --help | -h)
         echo "Usage: map-client <repo> \"Client Name\""
         echo "       map-client --list"
-        echo "       map-client --auto";;
+        echo "       map-client --auto"
+        ;;
+
     *)
-        [ $# -lt 2 ] && echo "Usage: map-client <repo> \"Client Name\"" && exit 1
-        tmp=$(mktemp) && { jq --arg r "$1" --arg c "$2" '. + {($r):$c}' "$MAP" > "$tmp" && mv "$tmp" "$MAP" && echo "✓ $1 → $2" || { rm -f "$tmp"; exit 1; }; };;
+        if [ $# -lt 2 ]; then
+            echo "Usage: map-client <repo> \"Client Name\""
+            exit 1
+        fi
+        update_map "$1" "$2" && echo "✓ $1 → $2"
+        ;;
 esac
 MAPPER
 
@@ -384,30 +552,69 @@ cat > "$DIR/weeklog.sh" << 'WEEKLOG'
 #!/usr/bin/env bash
 # weeklog — summarize git-timetrack activity
 set -e
+
 LOG="$HOME/.git-timetrack/activity.jsonl"
 MAP="$HOME/.git-timetrack/clients.json"
+
+# Default date range: this Monday → today
 FROM="$(python3 -c "from datetime import date,timedelta;d=date.today();print(d - timedelta(days=d.weekday()))")"
-TO="$(date +%Y-%m-%d)"; CF=""; DE=false; JO=false
+TO="$(date +%Y-%m-%d)"
+CLIENT_FILTER=""
+DRAFT_EMAILS=false
+JSON_OUTPUT=false
+
+# ── Validate a YYYY-MM-DD date string ──────────────────────
 
 validate_date() {
     if ! echo "$1" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
-        echo "Error: Invalid date format '$1'. Expected YYYY-MM-DD." >&2; exit 1
+        echo "Error: Invalid date format '$1'. Expected YYYY-MM-DD." >&2
+        exit 1
     fi
     if ! python3 -c "from datetime import datetime; datetime.strptime('$1','%Y-%m-%d')" 2>/dev/null; then
-        echo "Error: Invalid date '$1'." >&2; exit 1
+        echo "Error: Invalid date '$1'." >&2
+        exit 1
     fi
 }
 
-while [[ $# -gt 0 ]]; do case $1 in
-    --from) FROM="$2"; validate_date "$FROM"; shift 2;;
-    --to) TO="$2"; validate_date "$TO"; shift 2;;
-    --client) CF="$2";shift 2;;
-    --draft-emails) DE=true;shift;; --json) JO=true;shift;;
-    --help|-h) echo "Usage: weeklog [--from DATE] [--to DATE] [--client NAME] [--json] [--draft-emails]"; exit 0;;
-    *) shift;; esac; done
+# ── Parse arguments ─────────────────────────────────────────
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --from)
+            FROM="$2"
+            validate_date "$FROM"
+            shift 2
+            ;;
+        --to)
+            TO="$2"
+            validate_date "$TO"
+            shift 2
+            ;;
+        --client)
+            CLIENT_FILTER="$2"
+            shift 2
+            ;;
+        --draft-emails)
+            DRAFT_EMAILS=true
+            shift
+            ;;
+        --json)
+            JSON_OUTPUT=true
+            shift
+            ;;
+        --help | -h)
+            echo "Usage: weeklog [--from DATE] [--to DATE] [--client NAME] [--json] [--draft-emails]"
+            exit 0
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
 [ ! -f "$LOG" ] && echo "No activity yet. Make some commits first!" && exit 0
 
-exec python3 - "$FROM" "$TO" "$CF" "$DE" "$JO" << 'PY'
+exec python3 - "$FROM" "$TO" "$CLIENT_FILTER" "$DRAFT_EMAILS" "$JSON_OUTPUT" << 'PY'
 import json, sys, os, re
 from datetime import datetime, timedelta
 from collections import defaultdict
