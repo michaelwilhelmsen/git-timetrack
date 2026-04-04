@@ -4,70 +4,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**git-timetrack** is a passive time tracking tool that monitors git activity (commits, checkouts, merges, push/pull/rebase) and generates weekly time reports and client billing summaries. It installs via a single bash script that generates all application code into `~/.git-timetrack/`.
+**git-timetrack** is a Claude Code plugin that passively tracks git activity (commits, checkouts, merges, push/pull/rebase) and generates time reports and client billing summaries via conversational skills.
 
 ## Architecture
 
-This is an **installer-based project** — there is no traditional build system. All application logic lives inside `install.sh` as heredoc-embedded scripts. When `install.sh` runs, it generates and writes these files to the user's home directory:
+This is a **Claude Code plugin** — installed via `/plugin install`. The plugin provides:
 
-| Generated file | Purpose |
-|---|---|
-| `~/.git-timetrack/hook-handler.py` | Central event processor (Python) |
-| `~/.git-timetrack/weeklog.sh` | Terminal summarizer (bash + embedded Python) |
-| `~/.git-timetrack/map-client.sh` | Interactive repo→client mapping CLI |
-| `~/.claude/commands/weeklog.md` | Claude Code slash command |
-| `~/.git-timetrack/activity.jsonl` | JSON Lines activity log (append-only) |
-| `~/.git-timetrack/clients.json` | Repo-to-client name mapping |
-| `~/.git-timetrack/ignore` | Repos to exclude from tracking |
+| Component | File | Purpose |
+|---|---|---|
+| Hook handler | `bin/hook-handler.py` | PostToolUse hook — logs git events to JSONL |
+| Hook config | `hooks/hooks.json` | Routes `Bash(git *)` commands to the handler |
+| Timelog skill | `skills/timelog/SKILL.md` | `/git-timetrack:timelog` — activity summaries |
+| Map-client skill | `skills/map-client/SKILL.md` | `/git-timetrack:map-client` — repo→client mapping |
+| Plugin manifest | `.claude-plugin/plugin.json` | Plugin metadata |
 
-## Tracking Modes
+## Data Storage
 
-Two modes can be active simultaneously:
+All data lives at `~/.git-timetrack/`:
 
-1. **Claude Code Hook** — Uses Claude Code's `PostToolUse` hook system; `hook-handler.py` receives JSON on stdin describing each bash command Claude runs, extracts git metadata from the output.
-
-2. **Global Git Hooks** — Sets `git config --global core.hooksPath` to a directory containing `post-commit`, `post-checkout`, and `post-merge` hooks; these call `hook-handler.py` with CLI args after every git operation system-wide.
-
-## Installation & Development
-
-```bash
-# Install (interactive — prompts for tracking mode)
-bash install.sh
-
-# Uninstall
-bash install.sh --uninstall
-```
-
-**After install**, user commands available at `~/.local/bin/`:
-```bash
-weeklog                                   # Default weekly summary
-weeklog --json                            # Structured output
-weeklog --client acme                     # Filter by client
-weeklog --from 2025-03-01 --to 2025-03-31 # Date range
-map-client --auto                         # Interactive client mapping
-map-client my-repo "Client Name"          # Direct mapping
-```
-
-There are no tests, no linter config, and no build system. Changes to application logic mean editing the heredoc blocks inside `install.sh`.
+| File | Format | Purpose |
+|---|---|---|
+| `activity.jsonl` | JSON Lines (append-only) | One event per line |
+| `clients.json` | JSON object | `{"repo-name": "Client Name"}` mapping |
+| `ignore` | Plain text | Repo names to exclude (one per line) |
 
 ## Key Implementation Details
 
-**Data format** — Each event appended to `activity.jsonl` is one JSON object per line:
+**Data format** — Each event in `activity.jsonl`:
 ```json
-{"timestamp": "...", "event": "commit", "repo": "my-repo", "branch": "main", "client": "Acme Corp", "message": "...", "diff_stats": "..."}
+{"timestamp": "...", "event": "commit", "repo": "my-repo", "branch": "main", "client": "Acme Corp", "commit_hash": "...", "commit_message": "...", "files_changed": 3, "insertions": 42, "deletions": 7, "new_branch": "", "command": "...", "cwd": "..."}
 ```
 
-**Time estimation algorithm** — `weeklog.sh` estimates work time from activity patterns:
+**Time estimation** (used by the timelog skill):
 - Commits <2 hours apart → continuous work (sum the gaps)
 - Isolated commits → 30 min–2 hr based on diff size
 - Branch switches → +5 min context-switch overhead
 
-**hook-handler.py** handles two input modes: stdin JSON (from Claude Code hooks) and CLI args (from git hooks). It silently exits on failure to avoid blocking git operations.
+**hook-handler.py** reads PostToolUse JSON from stdin, detects git commands, runs git commands to gather state, and appends to the activity log. It silently exits on failure to avoid disrupting Claude Code.
 
-**Client mapping** — `clients.json` maps repo names to client names. `map-client` tool manages this. The ignore file (one repo name per line) excludes repos from tracking.
-
-## Claude Code Integration
-
-The `/weeklog` slash command (installed to `~/.claude/commands/weeklog.md`) lets Claude read `activity.jsonl` directly and summarize activity conversationally. Supports natural language: `/weeklog just the acme project`, `/weeklog in german`.
-
-The Claude Code hook is configured in `~/.claude/settings.json` under `hooks.PostToolUse` to invoke `hook-handler.py` via stdin pipe whenever Claude runs bash commands.
+**Plugin environment variables** — hooks.json uses `${CLAUDE_PLUGIN_ROOT}` to reference the handler script.
