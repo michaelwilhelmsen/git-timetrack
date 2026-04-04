@@ -1,5 +1,6 @@
 ---
-description: Map git repos to client names for time tracking reports. Use when the user wants to set up client mappings, has unmapped repos, or mentions map-client.
+name: map-client
+description: "Map git repos to client names for time tracking reports. Use when the user wants to set up client mappings, has unmapped repos, or mentions map-client."
 ---
 
 # Map Client — Manage repo-to-client mappings

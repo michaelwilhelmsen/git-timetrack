@@ -1,5 +1,6 @@
 ---
-description: Summarize git activity for time reports, standups, and client updates. Use when the user asks about what they worked on, wants a time report, needs to write a status update, or mentions timelog/weeklog.
+name: timelog
+description: "Summarize git activity for time reports, standups, and client updates. Use when the user asks about what they worked on, wants a time report, needs to write a status update, or mentions timelog/weeklog."
 ---
 
 # Timelog — Summarize git activity
