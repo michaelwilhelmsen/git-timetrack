@@ -1,0 +1,14 @@
+{
+  "name": "git-timetrack",
+  "owner": {
+    "name": "Michael Wilhelmsen"
+  },
+  "plugins": [
+    {
+      "name": "git-timetrack",
+      "source": "./",
+      "description": "Passive time tracking from git activity. Logs commits, checkouts, merges, and generates time reports with client billing summaries.",
+      "version": "1.0.0"
+    }
+  ]
+}
