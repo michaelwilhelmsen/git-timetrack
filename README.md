@@ -12,6 +12,10 @@ Then you ask Claude, and get:
 - Time estimates based on commit patterns
 - Client-ready email drafts in any language
 
+![Activity report per client](docs/screenshots/timelog-activity.png)
+
+![Two-week totals across all clients](docs/screenshots/timelog-totals.png)
+
 ## Requirements
 
 - [Claude Code](https://claude.ai/code)
