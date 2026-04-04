@@ -11,9 +11,9 @@ Import past commits from git repositories into `~/.git-timetrack/activity.jsonl`
 
 1. Determine which repos to import from:
    - If `$ARGUMENTS` specifies a path or repo, use that
-   - Otherwise, find the user's repos by scanning for git directories. Start by asking: **"Where do you keep your projects?"** Suggest common locations (`~/Documents`, `~/Development`, `~/Projects`, `~/Sites`, `~/code`, `~/repos`, `~/work`). Then scan the confirmed paths for git repos (look for `.git` directories, max 2 levels deep to avoid scanning node_modules etc.)
-   - Present the discovered repos as a checklist and let the user pick which ones to import
-   - Also check `activity.jsonl` for repos already tracked and include their paths if known from the `cwd` field
+   - Otherwise, check `activity.jsonl` for repos already tracked — extract unique paths from the `cwd` field and list them
+   - Then simply ask: **"Any other repos you'd like to import? Paste the paths."**
+   - Don't scan the filesystem — the user knows where their projects are
 2. Determine the date range:
    - If specified in `$ARGUMENTS`, use that
    - Default: last 2 weeks
