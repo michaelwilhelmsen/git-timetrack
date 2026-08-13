@@ -31,7 +31,7 @@ Do NOT write draft emails. Output the activity, the hours and the summary bullet
 - Stay honest — don't inflate small fixes
 - Default to English unless the user specifies otherwise
 - Warm, casual-professional tone unless told otherwise
-- If `$ARGUMENTS` given, adjust (e.g. "in german", "professional", "just acme", "last month", "today only", "draft invoice")
+- If `$ARGUMENTS` given, adjust (e.g. "in german", "professional", "just acme", "last month", "today only")
 
 ## Edge cases
 
