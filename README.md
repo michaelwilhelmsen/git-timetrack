@@ -10,7 +10,7 @@ Then you ask Claude, and get:
 
 - Per-project activity grouped by day
 - Time estimates based on commit patterns
-- Client-ready email drafts in any language
+- Client-ready summaries in any language
 
 ![Activity report per client](docs/screenshots/timelog-activity.png)
 
@@ -46,7 +46,7 @@ Use `/timelog` to summarize your activity. Claude reads your git history and wri
 
 > You can also use the full name `/git-timetrack:timelog`.
 
-Claude translates `fix: MutationObserver feedback loop in cart widget` into `Fixed an issue where the shopping cart wasn't updating correctly` — and writes a complete email draft you can review and send.
+Claude translates `fix: MutationObserver feedback loop in cart widget` into `Fixed an issue where the shopping cart wasn't updating correctly` — a client-ready summary you can use however you like.
 
 You can have a conversation about it: _"Combine those first two bullets."_ _"Make it more formal."_ _"Skip the infrastructure stuff, the client doesn't care."_
 
