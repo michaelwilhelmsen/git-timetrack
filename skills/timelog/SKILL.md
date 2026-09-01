@@ -12,15 +12,15 @@ Read `~/.git-timetrack/activity.jsonl` and `~/.git-timetrack/clients.json`.
 1. Parse the JSONL log (fields: timestamp, event, repo, branch, client, commit_hash, commit_message, files_changed, insertions, deletions, new_branch, command, cwd)
 2. Resolve repo → client using the mapping file
 3. Filter to the requested time range (default: **today**). Support natural language: "today", "yesterday", "this week", "last 3 days", "march", "last month", "since monday", etc.
-4. Group by client, then by **work session** — commits <2hrs apart belong to the same session
+4. Group by client, then by **work session** — commits <2hrs apart belong to the same session. ONLY a gap of 2+ hours starts a new session; a change of topic, feature, or branch never does. Do not split a session to keep descriptions single-topic — merge and combine the description instead
 5. Estimate hours per session: sum the gaps between commits; isolated commits = 30min–2hr by diff size; branch switches = +5min overhead
-6. **Round each session to the nearest 30 minutes** (minimum 30 min)
+6. **Round each session to the nearest 30 minutes** (minimum 30 min), and round the displayed start/end times to the nearest half hour so the time range matches the rounded duration (e.g. 06:42–09:10 → 06:30–09:00)
 
 ## Per client, output
 
-The output is meant for logging hours into timetracking software — one line per session, easy to copy over.
+The output is meant for logging hours into timetracking software — one line per session, copyable as-is (rounded times, rounded duration).
 
-- **Sessions**: one line each — date, start–end time, rounded duration, and a very short description (a few words, e.g. "Cart bug fixes", "Landing page"). NO jargon — no "refactor", "CI/CD", "SSH", "MutationObserver", "webpack", etc.
+- **Sessions**: one line each — date, rounded start–end time, rounded duration, and a very short description (a few words, e.g. "Cart bug fixes", "Landing page"). A session covering several topics combines them ("Operator console + cleanup fixes"). NO jargon — no "refactor", "CI/CD", "SSH", "MutationObserver", "webpack", etc.
 - **Total hours** for the range (sum of rounded sessions; note: approximate — only captures git activity)
 
 Do NOT write draft emails. Output the session lines and the total only.

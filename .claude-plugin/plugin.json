@@ -1,6 +1,6 @@
 {
   "name": "git-timetrack",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Passive time tracking from git activity. Logs commits, checkouts, merges, and generates time reports with client billing summaries.",
   "author": { "name": "Michael Wilhelmsen" },
   "repository": "https://github.com/michaelwilhelmsen/git-timetrack",
