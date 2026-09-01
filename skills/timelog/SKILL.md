@@ -12,25 +12,24 @@ Read `~/.git-timetrack/activity.jsonl` and `~/.git-timetrack/clients.json`.
 1. Parse the JSONL log (fields: timestamp, event, repo, branch, client, commit_hash, commit_message, files_changed, insertions, deletions, new_branch, command, cwd)
 2. Resolve repo → client using the mapping file
 3. Filter to the requested time range (default: **today**). Support natural language: "today", "yesterday", "this week", "last 3 days", "march", "last month", "since monday", etc.
-4. Group by client, then by day
-5. Estimate hours: commits <2hrs apart = continuous work; isolated commits = 30min–2hr by diff size; branch switches = +5min overhead
-6. Generate a client-friendly summary per client
+4. Group by client, then by **work session** — commits <2hrs apart belong to the same session
+5. Estimate hours per session: sum the gaps between commits; isolated commits = 30min–2hr by diff size; branch switches = +5min overhead
+6. **Round each session to the nearest 30 minutes** (minimum 30 min)
 
 ## Per client, output
 
-- **Raw activity**: commits grouped by day (developer reference)
-- **Estimated hours** (note: approximate — only captures git activity)
-- **Client summary**: 3–5 bullet points translating technical work into business outcomes. NO jargon — no "refactor", "CI/CD", "SSH", "MutationObserver", "webpack", etc.
-- **Draft email**: ready to review, with greeting and sign-off
+The output is meant for logging hours into timetracking software — one line per session, easy to copy over.
+
+- **Sessions**: one line each — date, start–end time, rounded duration, and a very short description (a few words, e.g. "Cart bug fixes", "Landing page"). NO jargon — no "refactor", "CI/CD", "SSH", "MutationObserver", "webpack", etc.
+- **Total hours** for the range (sum of rounded sessions; note: approximate — only captures git activity)
 
 ## Rules
 
-- Group related commits into themes (3 cart fixes → one bullet about cart improvements)
-- Translate to user/business impact
+- Group related commits in a session into one theme (3 cart fixes → "Cart fixes")
+- Descriptions are client-facing: business terms, not technical ones
 - Stay honest — don't inflate small fixes
 - Default to English unless the user specifies otherwise
-- Warm, casual-professional tone unless told otherwise
-- If `$ARGUMENTS` given, adjust (e.g. "in german", "professional", "just acme", "last month", "today only", "draft invoice")
+- If `$ARGUMENTS` given, adjust (e.g. "in german", "just acme", "last month", "today only")
 
 ## Edge cases
 
