@@ -14,6 +14,7 @@ This is a **Claude Code plugin** — installed via `/plugin install`. The plugin
 |---|---|---|
 | Hook handler | `bin/hook-handler.py` | PostToolUse hook — logs git events to JSONL |
 | Session reader | `bin/session-reader.py` | Derives measured sessions from Claude Code transcripts |
+| Busy push | `bin/busy-push.py` | Writes billable entries to Finago Busy's API as hour entries |
 | Hook config | `hooks/hooks.json` | Routes `Bash(git *)` commands to the handler |
 | Timelog skill | `skills/timelog/SKILL.md` | `/git-timetrack:timelog` — activity summaries |
 | Map-client skill | `skills/map-client/SKILL.md` | `/git-timetrack:map-client` — repo→client mapping |
@@ -29,6 +30,8 @@ All data lives at `~/.git-timetrack/`:
 | `sessions.jsonl` | JSON Lines (rebuilt in full) | One measured Claude Code session per line |
 | `clients.json` | JSON object | `{"repo-name": "Client Name"}` mapping |
 | `ignore` | Plain text | Repo names to exclude (one per line) |
+| `busy.json` | JSON object | Finago Busy mapping — `user_id`, `default_tag_id`, `clients` |
+| `busy-token` | Plain text | Finago Busy API token, mode 600 (or `$BUSY_TOKEN`) |
 
 ## Key Implementation Details
 
@@ -50,5 +53,11 @@ Subagents are read only to bridge gaps: when a subagent worked through a pause l
 `--report` is the skill's entry point: it rebuilds the log and prints a pre-aggregated digest (merged per client, rounded, commits matched, cross-client overlap flagged) so the skill never parses megabytes of JSONL into context. Past `BRIEF_THRESHOLD` sessions it drops to one line each to keep the output small.
 
 **hook-handler.py** reads PostToolUse JSON from stdin, detects git commands, runs git commands to gather state, and appends to the activity log. It silently exits on failure to avoid disrupting Claude Code.
+
+**busy-push.py** pushes billable entries to Finago Busy (`https://api.busy.no`, OpenAPI at `/v2/openapi.json`). `--json` on the reader emits the same rows as `--report` — both render from `digest_rows`, so they cannot drift — with an empty `description` and a `key` per line. The skill writes the description and picks the task; the script never invents time.
+
+The `key` becomes the hour entry's `externalId`, which makes a re-push idempotent: the script looks the keys up (`externalIdIn`, `isActive=all`) and creates, patches, revives or skips accordingly. Busy caps an externalId at 50 characters, so the client slug in the key is trimmed — changing `SLUG_CHARS` orphans every entry already written. Hour entries cannot be deleted through the API, only patched to `isActive: false`; that is what `undo` does. Entries Busy reports as locked or invoiced are left untouched.
+
+Writing is opt-in: `push` is a dry run unless `--commit`. Tags and tasks may be given by name or id, and a task-based project refuses an entry with no task. Lunch break deduction is not applied automatically to hours created via the API.
 
 **Plugin environment variables** — hooks.json uses `${CLAUDE_PLUGIN_ROOT}` to reference the handler script.

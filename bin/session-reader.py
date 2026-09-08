@@ -586,36 +586,31 @@ def bridged_in_range(bridged, since, until):
     return len(rows), sum((length for _, length in rows), timedelta())
 
 
-def digest(sessions, since, until, bridged, gap_mins):
-    """Compact, pre-aggregated output for the timelog skill to describe and format."""
+# Busy caps an externalId at 50 characters, and the key must survive intact
+# for a re-push to update its own entry rather than add a second one.
+SLUG_CHARS = 20
+
+
+def slug(text):
+    trimmed = re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", text.lower())).strip("-")
+    return trimmed[:SLUG_CHARS].rstrip("-")
+
+
+def digest_rows(sessions, since, until, gap_mins):
+    """One row per billable line: merged per client, billed, commits matched.
+
+    Both --report and --json render from this, so the printed digest and the
+    machine-readable one can never drift apart."""
     billable = billable_sessions(sessions, since, until, gap_mins)
     commits = load_commits(since, until)
     covered = set()
+    rows = []
 
-    end_label = (until or datetime.now(timezone.utc)).astimezone()
-    print(f"RANGE {since.astimezone():%Y-%m-%d %H:%M} .. {end_label:%Y-%m-%d %H:%M} (local)")
-
-    total_entries = sum(len(rows) for rows in billable.values())
-    brief = total_entries > BRIEF_THRESHOLD
-
-    grand = 0.0
-    billed_raw = 0.0
-    measured = 0.0
-    unmapped = set()
     for client in sorted(billable):
-        rows = sorted(billable[client], key=lambda r: r["start"])
-        print(f"\n{client}")
-        for row in rows:
+        for row in sorted(billable[client], key=lambda r: r["start"]):
             span = (row["end"] - row["start"]).total_seconds() / 3600
             hours = bill_hours(span)
-            grand += hours
-            billed_raw += span
-            measured += sum((b["end"] - b["start"]).total_seconds() / 3600
-                            for b in row["blocks"])
             start = round_clock(row["start"])
-            end = start + timedelta(hours=hours)
-            messages = sum(b["messages"] for b in row["blocks"])
-            restarts = len({sid for b in row["blocks"] for sid in b["session_ids"]})
 
             inside = []
             for stamp, event in commits:
@@ -623,48 +618,95 @@ def digest(sessions, since, until, bridged, gap_mins):
                     inside.append(event)
                     covered.add(event.get("commit_hash"))
 
-            labels = [t for b in row["blocks"] for t in b["titles"]]
-            labels += [p for b in row["blocks"] for p in b["prompts"]]
-            if brief:
-                first = (labels[0][:DIGEST_CHARS] if labels
-                         else (inside[0].get("commit_message", "")[:DIGEST_CHARS] if inside else ""))
-                print(f"  {row['start']:%a %d.%m}  {start:%H:%M}-{end:%H:%M}  {hours:>4.1f}h  "
-                      f"[{len(inside)}c, {restarts}s, {'+'.join(sorted(row['repos']))}]  {first}")
-                continue
-
-            print(f"  {row['start']:%a %d.%m}  {start:%H:%M}-{end:%H:%M}  {hours:>4.1f}h  "
-                  f"[{messages} msg, {len(inside)} commits, {restarts} "
-                  f"session{'s' if restarts != 1 else ''}, {'+'.join(sorted(row['repos']))}]")
-            for label, values in (("titles", [t for b in row["blocks"] for t in b["titles"]]),
-                                  ("prompts", [p for b in row["blocks"] for p in b["prompts"]])):
-                values = list(dict.fromkeys(values))[:3]
-                if values:
-                    print(f"    {label}: " + " | ".join(v[:DIGEST_CHARS] for v in values))
-            subjects = list(dict.fromkeys(e.get("commit_message", "") for e in inside))
-            if subjects:
-                shown = subjects[:MAX_COMMITS_SHOWN]
-                more = f" (+{len(subjects) - len(shown)})" if len(subjects) > len(shown) else ""
-                print("    commits: " + " | ".join(x[:DIGEST_CHARS] for x in shown) + more)
-            if any(not b.get("resolved") for b in row["blocks"]):
-                print("    NOTE unresolved repo — name guessed from a path that no longer exists")
-        for row in rows:
-            resolved = {r for b in row["blocks"] if b.get("resolved") for r in row["repos"]}
-            for repo in resolved:
-                if not get_client(repo):
-                    unmapped.add(repo)
+            rows.append({
+                "client": client,
+                "begin": row["start"],
+                "start": start,
+                "end": start + timedelta(hours=hours),
+                "hours": hours,
+                "span": span,
+                "measured": sum((b["end"] - b["start"]).total_seconds() / 3600
+                                for b in row["blocks"]),
+                "messages": sum(b["messages"] for b in row["blocks"]),
+                "restarts": len({sid for b in row["blocks"] for sid in b["session_ids"]}),
+                "repos": sorted(row["repos"]),
+                "titles": list(dict.fromkeys(t for b in row["blocks"] for t in b["titles"])),
+                "prompts": list(dict.fromkeys(p for b in row["blocks"] for p in b["prompts"])),
+                "commits": list(dict.fromkeys(e.get("commit_message", "") for e in inside)),
+                "commit_count": len(inside),
+                "resolved": all(b.get("resolved") for b in row["blocks"]),
+                "key": f"gtt:{start:%Y-%m-%d}:{slug(client)}:{start:%H%M}",
+            })
 
     outside = defaultdict(list)
     for stamp, event in commits:
         if event.get("commit_hash") not in covered:
             outside[get_client(event.get("repo", "")) or event.get("repo", "")].append((stamp, event))
+
+    unmapped = set()
+    for blocks in billable.values():
+        for row in blocks:
+            for block in row["blocks"]:
+                if not block.get("resolved"):
+                    continue
+                for repo in row["repos"]:
+                    if not get_client(repo):
+                        unmapped.add(repo)
+
+    return rows, outside, billable, unmapped
+
+
+def digest(sessions, since, until, bridged, gap_mins):
+    """Compact, pre-aggregated output for the timelog skill to describe and format."""
+    rows, outside, billable, unmapped = digest_rows(sessions, since, until, gap_mins)
+
+    end_label = (until or datetime.now(timezone.utc)).astimezone()
+    print(f"RANGE {since.astimezone():%Y-%m-%d %H:%M} .. {end_label:%Y-%m-%d %H:%M} (local)")
+
+    total_entries = len(rows)
+    brief = total_entries > BRIEF_THRESHOLD
+
+    grand = sum(r["hours"] for r in rows)
+    billed_raw = sum(r["span"] for r in rows)
+    measured = sum(r["measured"] for r in rows)
+
+    client = None
+    for row in rows:
+        if row["client"] != client:
+            client = row["client"]
+            print(f"\n{client}")
+
+        head = (f"  {row['begin']:%a %d.%m}  {row['start']:%H:%M}-{row['end']:%H:%M}  "
+                f"{row['hours']:>4.1f}h")
+        if brief:
+            labels = row["titles"] + row["prompts"] + row["commits"]
+            first = labels[0][:DIGEST_CHARS] if labels else ""
+            print(f"{head}  [{row['commit_count']}c, {row['restarts']}s, "
+                  f"{'+'.join(row['repos'])}]  {first}")
+            continue
+
+        print(f"{head}  [{row['messages']} msg, {row['commit_count']} commits, "
+              f"{row['restarts']} session{'s' if row['restarts'] != 1 else ''}, "
+              f"{'+'.join(row['repos'])}]")
+        for label in ("titles", "prompts"):
+            values = row[label][:3]
+            if values:
+                print(f"    {label}: " + " | ".join(v[:DIGEST_CHARS] for v in values))
+        if row["commits"]:
+            shown = row["commits"][:MAX_COMMITS_SHOWN]
+            more = f" (+{len(row['commits']) - len(shown)})" if len(row["commits"]) > len(shown) else ""
+            print("    commits: " + " | ".join(x[:DIGEST_CHARS] for x in shown) + more)
+        if not row["resolved"]:
+            print("    NOTE unresolved repo — name guessed from a path that no longer exists")
+
     if outside:
         print("\nCOMMITS OUTSIDE ANY SESSION (work without Claude Code — estimate these)")
         for client in sorted(outside):
-            rows = sorted(outside[client], key=lambda r: r[0])
-            hours = estimate_git_group([(r[0], r[1]) for r in rows])
-            subjects = list(dict.fromkeys(e.get("commit_message", "") for _, e in rows))
-            print(f"  {client}: {len(rows)} commits, ~{hours:.1f}h est  "
-                  f"({rows[0][0]:%a %d.%m %H:%M}-{rows[-1][0]:%H:%M})")
+            group = sorted(outside[client], key=lambda r: r[0])
+            hours = estimate_git_group([(r[0], r[1]) for r in group])
+            subjects = list(dict.fromkeys(e.get("commit_message", "") for _, e in group))
+            print(f"  {client}: {len(group)} commits, ~{hours:.1f}h est  "
+                  f"({group[0][0]:%a %d.%m %H:%M}-{group[-1][0]:%H:%M})")
             print("    " + " | ".join(x[:DIGEST_CHARS] for x in subjects[:MAX_COMMITS_SHOWN]))
 
     overlaps, union = cross_client_overlaps(billable)
@@ -690,6 +732,45 @@ def digest(sessions, since, until, bridged, gap_mins):
     if unmapped:
         print("UNMAPPED " + ", ".join(sorted(unmapped)) + " — suggest /git-timetrack:map-client")
 
+
+def digest_json(sessions, since, until, gap_mins):
+    """The same rows as --report, for busy-push.py.
+
+    `description` is left empty on purpose: the clock comes from here, the
+    client-facing wording from the timelog skill."""
+    rows, outside, _, unmapped = digest_rows(sessions, since, until, gap_mins)
+
+    entries = [{
+        "key": row["key"],
+        "client": row["client"],
+        "date": f"{row['start']:%Y-%m-%d}",
+        "start": f"{row['start']:%H:%M}",
+        "hours": round(row["hours"], 2),
+        "description": "",
+        "evidence": {
+            "repos": row["repos"],
+            "sessions": row["restarts"],
+            "messages": row["messages"],
+            "titles": row["titles"][:6],
+            "prompts": row["prompts"][:6],
+            "commits": row["commits"][:MAX_COMMITS_SHOWN],
+        },
+    } for row in rows]
+
+    print(json.dumps({
+        "range": {"since": f"{since.astimezone():%Y-%m-%d}",
+                  "until": f"{(until or datetime.now(timezone.utc)).astimezone():%Y-%m-%d}"},
+        "total_hours": round(sum(r["hours"] for r in rows), 2),
+        "entries": entries,
+        "outside_sessions": [{
+            "client": client,
+            "commits": len(group),
+            "estimated_hours": round(estimate_git_group([(s, e) for s, e in group]), 2),
+            "subjects": list(dict.fromkeys(e.get("commit_message", "") for _, e in group)),
+        } for client, group in sorted(outside.items())],
+        "unmapped_repos": sorted(unmapped),
+    }, indent=2, ensure_ascii=False))
+
 # ── Main ────────────────────────────────────────────────────
 
 def main():
@@ -699,6 +780,8 @@ def main():
                         help="compare measured sessions against git estimates, write nothing")
     parser.add_argument("--report", action="store_true",
                         help="print a compact digest of the range for the timelog skill")
+    parser.add_argument("--json", action="store_true",
+                        help="print the same rows as JSON, for busy-push.py")
     parser.add_argument("--until", metavar="DATE",
                         help="report sessions starting on/before this date (YYYY-MM-DD)")
     parser.add_argument("--since", metavar="DATE",
@@ -730,12 +813,15 @@ def main():
         until = (datetime.strptime(args.until, "%Y-%m-%d")
                  .replace(hour=23, minute=59, second=59).astimezone())
 
-    if args.report:
+    if args.report or args.json:
         if not since:
             since = datetime.now(timezone.utc) - timedelta(days=7)
         if not args.dry_run:
             write_sessions(sessions)
-        digest(sessions, since, until, bridged, args.gap)
+        if args.json:
+            digest_json(sessions, since, until, args.gap)
+        else:
+            digest(sessions, since, until, bridged, args.gap)
         return
 
     if args.dry_run:
