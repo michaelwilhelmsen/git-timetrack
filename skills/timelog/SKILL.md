@@ -1,48 +1,88 @@
 ---
 name: timelog
-description: "Summarize git activity for time reports, standups, and client updates. Use when the user asks about what they worked on, wants a time report, needs to write a status update, or mentions timelog/weeklog."
+description: "Summarize git and Claude Code activity for time reports, standups, and client updates. Use when the user asks about what they worked on, wants a time report, needs to write a status update, or mentions timelog/weeklog."
 ---
 
-# Timelog — Summarize git activity
+# Timelog — Summarize work sessions
 
-Read `~/.git-timetrack/activity.jsonl` and `~/.git-timetrack/clients.json`.
+Two sources, with different strengths:
+
+| File | What it is | Use it for |
+|---|---|---|
+| `~/.git-timetrack/sessions.jsonl` | **Measured** spans of Claude Code activity | The clock — start, end, duration |
+| `~/.git-timetrack/activity.jsonl` | Commit points from git | What was delivered, and work done outside Claude Code |
+| `~/.git-timetrack/clients.json` | repo → client mapping | Attribution |
 
 ## Task
 
-1. Parse the JSONL log (fields: timestamp, event, repo, branch, client, commit_hash, commit_message, files_changed, insertions, deletions, new_branch, command, cwd)
-2. Resolve repo → client using the mapping file
-3. Filter to the requested time range (default: **today**). Support natural language: "today", "yesterday", "this week", "last 3 days", "march", "last month", "since monday", etc. Build sessions from events up to ~3 hours PAST the range end, then keep the sessions that **start** inside the range — work that runs past midnight belongs to the day it started, and a range boundary must never cut a session in half
-4. Group by client, then by **work session** — commits <1.5hrs apart belong to the same session. ONLY a gap of 1.5+ hours starts a new session; a change of topic, feature, or branch never does. Do not split a session to keep descriptions single-topic — merge and combine the description instead
-5. Estimate hours per session: sum the gaps between commits; isolated commits = 30min–2hr by diff size; branch switches = +5min overhead
-6. **Round each session to the nearest 30 minutes** (minimum 30 min), and round the displayed start/end times to the nearest half hour so the time range matches the rounded duration (e.g. 06:42–09:10 → 06:30–09:00)
+**Run the reader. Do not parse the logs yourself.** It does the merging, rounding, client grouping, commit matching and overlap detection, and returns a digest of a few KB. Reading the raw logs instead costs tens of thousands of tokens for the same answer.
+
+1. Work out the date range from the request (default: **today**), in the user's local timezone. Support natural language: "today", "yesterday", "this week", "last 3 days", "march", "last month", "since monday", etc.
+2. Run the reader **once** — it rebuilds from the transcripts and prints the digest in the same pass:
+   ```bash
+   python3 ${CLAUDE_PLUGIN_ROOT}/bin/session-reader.py --report --since 2026-09-01 --until 2026-09-07
+   ```
+   `--days N` works instead of the dates. It takes a few seconds and only reads local files. If it fails, say so and fall back to reading `activity.jsonl` yourself, noting that the report is then estimated from commits rather than measured.
+3. Read the digest. Each line is `date  start-end  hours  [msg, commits, sessions, repos]` — one stretch of continuous work for one client, already merged and billed per the policy below, followed by its `titles`, `prompts` and `commits` as description material.
+4. Write a short description per session from that evidence, preferring `titles`, then `prompts`, then the commit subjects. Commits are the best evidence of what actually shipped
+5. Report the `COMMITS OUTSIDE ANY SESSION` block as its own estimated lines — that is work done without Claude Code
+6. Never recompute the hours. The digest's numbers are the answer; only the wording is yours
+
+Only read `sessions.jsonl` or `activity.jsonl` directly if the digest is missing something specific — and then grep for the few lines you need, never the whole file.
 
 ## Per client, output
 
 The output is meant for logging hours into timetracking software — one line per session, copyable as-is (rounded times, rounded duration).
 
 - **Sessions**: one line each — date, rounded start–end time, rounded duration, and a very short description (a few words, e.g. "Cart bug fixes", "Landing page"). A session covering several topics combines them ("Operator console + cleanup fixes"). NO jargon — no "refactor", "CI/CD", "SSH", "MutationObserver", "webpack", etc.
-- **Total hours** for the range (sum of rounded sessions; note: approximate — only captures git activity)
+- **Total hours** for the range
 
 Do NOT write draft emails. Output the session lines and the total only.
 
+## Billing policy
+
+The digest already applies these — never recompute them, and never talk the numbers down:
+
+- The billable unit is **continuous work for one client**, not one Claude Code session. Sessions get restarted mid-task to manage context, so a single billable line routinely spans several sessions and several repos of that client. The `sessions` count on each line shows how many were merged. Never split a line by session, repo, branch or topic
+- A started task bills **at least 30 minutes**
+- Part-hours **round up** to the next 30-minute step: 1h05 → 1h30, 2h35 → 3h00
+- **Parallel work bills to every client.** Two clients worked at the same time are both billed in full; the hour is not split between them
+
 ## Rules
 
-- Group related commits in a session into one theme (3 cart fixes → "Cart fixes")
+- Group related work in a session into one theme (3 cart fixes → "Cart fixes")
 - Descriptions are client-facing: business terms, not technical ones
+- **Never paste prompt text into the output.** Prompts are private working notes — read them, then write your own short description
 - Stay honest — don't inflate small fixes
 - Default to English unless the user specifies otherwise
 - If `$ARGUMENTS` given, adjust (e.g. "in german", "just acme", "last month", "today only")
 
+## What the digest's footer means
+
+- `TOTAL` — the sum to report. An "entry" is one billable line; the `sessions` count inside a line is how many Claude Code sessions it merged
+- `MEASURED` — actual session activity, with the two reasons `TOTAL` sits above it: merged gaps under 30 minutes, and rounding up. Both are the billing policy working as intended, not error. Mention the spread only if asked
+- `PARALLEL WORK` — the same wall-clock hour under two clients, from parallel sessions. Correct and already in `TOTAL`: parallel work bills to every client. Do not deduct it, do not flag it as a conflict, do not ask how to split
+- `BRIDGED` — waits where a subagent was working and the user was not prompting. Already included; mention it only if asked
+- `BRIEF` — the range was too long for per-entry evidence. Descriptions will be thin; offer to narrow the range
+- `UNMAPPED` — suggest `/git-timetrack:map-client`
+
 ## Parsing notes
 
-- Timestamps are **UTC** ("Z" suffix) — parse and convert to the user's local timezone before filtering and display. Never filter by date-substring match; local midnight is not UTC midnight
-- The log can be large. Do it in ONE script/pass: grep-prefilter lines by date **with a day of slack on each side** (timezone + boundary sessions), then `json.loads` only those. The log is append-only and effectively time-ordered
-- Multiple events can share the exact same timestamp — sort with `key=lambda x: x[0]` (or equivalent), never by tuples containing dicts
-- The `client` field in events is often empty — always resolve through `clients.json` by repo name
+The digest is already in local time and needs no conversion. These apply only when falling back to the raw logs:
+
+- Timestamps there are **UTC** ("Z" suffix) — convert to local before filtering and display. Never filter by date-substring match; local midnight is not UTC midnight
+- Both logs can be large (`activity.jsonl` is megabytes). Do it in ONE script/pass: prefilter lines by date **with a day of slack on each side** (timezone + boundary sessions), then `json.loads` only those. Never print raw log lines
+- Multiple records can share the exact same timestamp — sort with `key=lambda x: x[0]` (or equivalent), never by tuples containing dicts
+- The `client` field is often empty — always resolve through `clients.json` by repo name
+- A session line marked `NOTE unresolved repo` had its name guessed from a path that no longer exists (a deleted worktree, a scratch folder). Include the time, but check the guess against the titles and prompts before attributing it to a client — and say which sessions these were
+- `sessions.jsonl` is derived data, rebuilt in full on every reader run — never append to it by hand
 
 ## Edge cases
 
-- No log file → explain that the plugin hooks into git commands automatically and tracking will begin once commits are made in Claude Code sessions
+- No `sessions.jsonl` and the reader fails → fall back to `activity.jsonl` only, and say the report is estimated from commits
+- No log files at all → explain that the plugin tracks git commands automatically and reads Claude Code transcripts, and that tracking begins with the next session
 - Unmapped repos → list them, suggest running `/git-timetrack:map-client`
-- Low time estimate → note it only captures git activity, actual work time is likely higher
+- Sessions but no commits in range → normal (research, debugging, reviews). Report the time, describe from titles and prompts
+- A session line with very few messages and a long span → likely a session left open. Flag it rather than billing it silently
+- Commits but no sessions → work done outside Claude Code. Report it estimated, and note the distinction
 - No activity in range → say so clearly, suggest a wider range
