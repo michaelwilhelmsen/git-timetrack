@@ -48,6 +48,25 @@ The digest already applies these — never recompute them, and never talk the nu
 - Part-hours **round up** to the next 30-minute step: 1h05 → 1h30, 2h35 → 3h00
 - **Parallel work bills to every client.** Two clients worked at the same time are both billed in full; the hour is not split between them
 
+## Pushing to Finago Busy
+
+Only when the user asks for it ("legg inn timene", "push til Busy"). The report itself never writes anything.
+
+1. Re-run the reader with `--json` for the same range — same rows, same hours, plus a stable `key` per line:
+   ```bash
+   python3 ${CLAUDE_PLUGIN_ROOT}/bin/session-reader.py --json --since 2026-09-02 --until 2026-09-08 > /tmp/entries.json
+   ```
+2. Write the entries file outside the repo (`/tmp`, or the scratchpad) — it names real clients and projects. Fill in each entry's `description` with the same wording you wrote in the report, and add a `task` (name or id) per entry — the project's own task list, picked from the evidence for that line. Add `tag` where the default is wrong (evening or night fixes, project management, meetings). Drop the `evidence` blocks; keep `key`, `client`, `date`, `start`, `hours`.
+3. Show the dry run and let the user read it before anything is written:
+   ```bash
+   python3 ${CLAUDE_PLUGIN_ROOT}/bin/busy-push.py push /tmp/entries.json
+   ```
+4. Only after the user confirms, add `--commit`.
+
+Never invent hours, dates or keys here — they come from `--json` untouched. A re-run updates the entries it wrote before, keyed on `externalId`, so pushing twice does not double-book. `busy-push.py undo entries.json --commit` deletes what it wrote. `busy-push.py lookup` lists projects, tasks, tags and users when the mapping in `~/.git-timetrack/busy.json` needs a new client.
+
+A line that Busy reports as locked or already invoiced is left alone — say so rather than working around it.
+
 ## Rules
 
 - Group related work in a session into one theme (3 cart fixes → "Cart fixes")

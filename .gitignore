@@ -4,3 +4,10 @@
 *~
 __pycache__/
 *.pyc
+
+# Local Finago Busy state — the mapping names real clients and projects, and
+# the token is a password. Both belong in ~/.git-timetrack, never in git.
+busy.json
+busy-token
+entries.json
+entries-*.json

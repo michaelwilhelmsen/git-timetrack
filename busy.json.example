@@ -1,0 +1,12 @@
+{
+  "user_id": "<your Busy user id — busy-push.py lookup>",
+  "default_tag_id": "<tag id used when an entry names none>",
+  "exclude": ["Client whose hours are not tracked in Busy"],
+  "clients": {
+    "Client name as it appears in the timelog": {
+      "project_id": "<Busy project id>",
+      "task_id": "<optional default task; a task-based project needs one>",
+      "tag_id": "<optional, overrides default_tag_id for this client>"
+    }
+  }
+}

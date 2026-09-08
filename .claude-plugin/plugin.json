@@ -1,6 +1,6 @@
 {
   "name": "git-timetrack",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Passive time tracking from git activity and Claude Code sessions. Measures real session spans, logs git events, and generates time reports with client billing summaries.",
   "author": { "name": "Michael Wilhelmsen" },
   "repository": "https://github.com/michaelwilhelmsen/git-timetrack",
