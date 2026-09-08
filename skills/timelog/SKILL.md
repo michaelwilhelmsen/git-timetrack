@@ -65,7 +65,15 @@ Only when the user asks for it ("legg inn timene", "push til Busy"). The report 
 
 Never invent hours, dates or keys here — they come from `--json` untouched. A re-run updates the entries it wrote before, keyed on `externalId`, so pushing twice does not double-book. `busy-push.py undo entries.json --commit` deletes what it wrote. `busy-push.py lookup` lists projects, tasks, tags and users when the mapping in `~/.git-timetrack/busy.json` needs a new client.
 
-A line that Busy reports as locked or already invoiced is left alone — say so rather than working around it.
+### What the dry run can tell you
+
+- `OVERLAP` — the line covers hours already in Busy: logged by hand, or pushed earlier under a different key. **Nothing is written and the run stops.** Never pass `--force` on your own judgement — hours logged by hand are usually the correct ones, since they are what the client was invoiced from. Show the clash, say which is which, and let the user decide: drop those lines, or overwrite them
+- `JOIN` — two or more lines met end-to-end on the same project, task and tag, so they go in as one entry with the descriptions joined. Busy shows one card per entry; this is what keeps a day from looking like confetti. Report the joined line, not the pieces
+- `DELETED` — the entry was deleted in Busy after a previous push. It is left alone, because reviving it would undo the user's own cleanup every time the week is pushed again
+- `LOCKED` — locked or already invoiced. Left untouched; say so rather than working around it
+- `SKIP` — no mapping, or a task the project does not have. Fix the mapping, don't guess a different project
+
+The hours in Busy are live and other people share the workspace, so treat a reading as a snapshot: if the user is tidying up while you work, re-run the dry run rather than trusting what you saw a few minutes ago.
 
 ## Rules
 

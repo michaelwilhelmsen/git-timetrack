@@ -9,6 +9,11 @@ Pushes billable entries to Busy's public API as hour entries.
   busy-push.py push entries.json --commit
   busy-push.py undo entries.json --commit     delete what it wrote
 
+Two guards: lines that meet end-to-end on the same project, task and tag are
+written as one entry with both descriptions, and a line covering hours already
+logged in Busy — by hand, or by an earlier push under another key — stops the
+run unless --force.
+
 The entries file is written by the timelog skill: the reader supplies the
 clock, the skill supplies the client-facing description. Each entry carries a
 `key` that becomes the hour entry's externalId, so a re-run updates the entry
@@ -227,22 +232,24 @@ def resolve(entry, config, names):
             "billable": bool(names.project(str(project)).get("isBillable"))}, None
 
 
-def to_payload(entry, config, target):
-    start = datetime.strptime(f"{entry['date']} {entry['start']}", "%Y-%m-%d %H:%M").astimezone()
-    stop = start + timedelta(hours=float(entry["hours"]))
-    minutes = round(float(entry["hours"]) * 60)
+JOIN = " · "
+
+
+def to_payload(row, config):
+    start = row["start"]
+    stop = start + timedelta(hours=row["hours"])
     payload = {
         "userId": config["user_id"],
-        "projectId": target["project_id"],
-        "tagId": target["tag_id"],
-        "description": entry["description"],
+        "projectId": row["target"]["project_id"],
+        "tagId": row["target"]["tag_id"],
+        "description": JOIN.join(row["descriptions"]),
         "startTime": start.isoformat(timespec="seconds"),
         "stopTime": stop.isoformat(timespec="seconds"),
-        "billableMinutes": minutes,
-        "externalId": entry["key"],
+        "billableMinutes": round(row["hours"] * 60),
+        "externalId": row["keys"][0],
     }
-    if target["task_id"]:
-        payload["taskId"] = target["task_id"]
+    if row["target"]["task_id"]:
+        payload["taskId"] = row["target"]["task_id"]
     return payload
 
 
@@ -269,70 +276,192 @@ def differs(existing, payload, billable=True):
     return changed
 
 
-def push(api, entries, commit):
-    config = load_config()
-    names = Names(api)
+def plan(entries, config, names):
+    """Resolve each line, then join the ones that meet end-to-end.
 
-    keys = [e["key"] for e in entries]
-    existing = {}
-    for i in range(0, len(keys), 50):
-        for row in api.get_all("/v2/hourEntries/", {"externalIdIn": keys[i:i + 50]}):
-            if row.get("externalId"):
-                existing[row["externalId"]] = row
+    Busy shows one card per hour entry, so two lines that touch on the same
+    project, task and tag belong in one card with both descriptions. Only
+    exactly contiguous lines are joined — anything looser would change the
+    billed total, which is the reader's to decide, not this script's."""
+    rows, excluded, failed = [], [], []
 
-    created = updated = unchanged = failed = excluded = 0
     for entry in sorted(entries, key=lambda e: (e["date"], e["start"])):
-        label = f"{entry['date']} {entry['start']} {float(entry['hours']):>4.1f}h  {entry['client']}"
         if entry["client"] in (config.get("exclude") or []):
-            print(f"  EXCLUDE {label}  — not tracked in Busy")
-            excluded += 1
+            excluded.append(entry)
             continue
-
         target, problem = resolve(entry, config, names)
         if problem:
-            print(f"  SKIP    {label}  — {problem}")
-            failed += 1
+            failed.append((entry, problem))
             continue
+        rows.append({
+            "entry": entry,
+            "target": target,
+            "start": datetime.strptime(f"{entry['date']} {entry['start']}",
+                                       "%Y-%m-%d %H:%M").astimezone(),
+            "hours": float(entry["hours"]),
+            "keys": [entry["key"]],
+            "descriptions": [entry["description"]],
+        })
 
-        payload = to_payload(entry, config, target)
-        current = existing.get(entry["key"])
+    merged = []
+    for row in rows:
+        joinable = next((m for m in merged
+                         if m["target"] == row["target"]
+                         and m["start"] + timedelta(hours=m["hours"]) == row["start"]), None)
+        if joinable:
+            joinable["hours"] += row["hours"]
+            joinable["keys"] += row["keys"]
+            joinable["descriptions"] += row["descriptions"]
+        else:
+            merged.append(row)
+    return merged, excluded, failed
+
+
+def clashes_with_existing(api, config, rows):
+    """Hours already in Busy for this user covering the same wall-clock time.
+
+    The externalId check only ever finds this script's own entries, so without
+    this an hour logged by hand — or by an earlier push under another key —
+    is silently doubled."""
+    if not rows:
+        return {}
+
+    ours = {key for row in rows for key in row["keys"]}
+    first = min(row["start"] for row in rows) - timedelta(days=1)
+    last = max(row["start"] + timedelta(hours=row["hours"]) for row in rows)
+
+    others = []
+    for found in api.get_all("/v2/hourEntries/", {
+            "userIdIn": config["user_id"],
+            "startTimeFrom": first.isoformat(timespec="seconds"),
+            "startTimeTo": last.isoformat(timespec="seconds"),
+            "isActive": "true"}):
+        if (found.get("externalId") or "") in ours:
+            continue
+        try:
+            # The API answers in UTC; every time this script prints or
+            # compares is local, so convert on the way in.
+            start = datetime.fromisoformat(found["startTime"]).astimezone()
+            stop = datetime.fromisoformat(found["stopTime"]).astimezone()
+        except (KeyError, TypeError, ValueError):
+            continue
+        others.append((start, stop, found))
+
+    found = {}
+    for row in rows:
+        start = row["start"]
+        stop = start + timedelta(hours=row["hours"])
+        hits = [other for other in others if other[0] < stop and other[1] > start]
+        if hits:
+            found[row["keys"][0]] = hits
+    return found
+
+
+def push(api, entries, commit, force=False):
+    config = load_config()
+    names = Names(api)
+    rows, excluded, failed = plan(entries, config, names)
+
+    keys = [key for row in rows for key in row["keys"]]
+    existing = {}
+    for i in range(0, len(keys), 50):
+        for found in api.get_all("/v2/hourEntries/",
+                                 {"externalIdIn": keys[i:i + 50], "isActive": "all"}):
+            if found.get("externalId"):
+                existing[found["externalId"]] = found
+
+    clashes = clashes_with_existing(api, config, rows)
+
+    def label_of(row):
+        return (f"{row['start']:%Y-%m-%d %H:%M} {row['hours']:>4.1f}h  "
+                f"{row['entry']['client']}")
+
+    for entry in excluded:
+        print(f"  EXCLUDE {entry['date']} {entry['start']} {float(entry['hours']):>4.1f}h  "
+              f"{entry['client']}  — not tracked in Busy")
+    for entry, problem in failed:
+        print(f"  SKIP    {entry['date']} {entry['start']} {float(entry['hours']):>4.1f}h  "
+              f"{entry['client']}  — {problem}")
+
+    if clashes and not force:
+        print()
+        for row in rows:
+            hits = clashes.get(row["keys"][0])
+            if not hits:
+                continue
+            print(f"  OVERLAP {label_of(row)}  {JOIN.join(row['descriptions'])}")
+            for start, stop, other in hits:
+                mark = " (invoiced)" if other.get("invoiceId") else ""
+                print(f"            already logged {start:%d.%m %H:%M}-{stop:%H:%M}  "
+                      f"{other.get('description') or '(no text)'}{mark}")
+        print(f"\n{len(clashes)} of {len(rows)} entries cover hours you have already logged. "
+              f"Nothing was written.")
+        print("Remove those lines from the entries file, or pass --force to write them anyway.")
+        return 1
+
+    created = updated = unchanged = removed = 0
+    for row in rows:
+        label = label_of(row)
+        payload = to_payload(row, config)
+        if len(row["keys"]) > 1:
+            print(f"  JOIN    {label}  — {len(row['keys'])} adjacent lines in one entry")
+
+        current = existing.get(row["keys"][0])
         if current is not None and not current.get("isActive", True):
-            print(f"  REVIVE  {label}  — was deleted in Busy, restoring it")
+            # Someone deleted this in Busy on purpose. Bringing it back
+            # because the reader still reports the hours would undo their
+            # cleanup every time the week is pushed again.
+            if not force:
+                print(f"  DELETED {label}  — deleted in Busy, left alone")
+                unchanged += 1
+                continue
+            print(f"  REVIVE  {label}  — deleted in Busy, restoring it (--force)")
             if commit:
                 api.request("PATCH", f"/v2/hourEntries/{current['id']}",
                             body={**{k: payload[k] for k in CHECKED if k in payload},
                                   "isActive": True})
             updated += 1
-            continue
-
-        if current is None:
-            print(f"  CREATE  {label}  {entry['description']}")
+        elif current is None:
+            print(f"  CREATE  {label}  {payload['description']}")
             if commit:
                 api.request("POST", "/v2/hourEntries/", body=payload)
             created += 1
-            continue
-
-        if current.get("locked") or current.get("invoiceId"):
+        elif current.get("locked") or current.get("invoiceId"):
             print(f"  LOCKED  {label}  — already locked or invoiced in Busy, leaving it alone")
             unchanged += 1
-            continue
+        else:
+            changed = differs(current, payload, row["target"]["billable"])
+            if changed:
+                print(f"  UPDATE  {label}  — {', '.join(changed)}")
+                if commit:
+                    api.request("PATCH", f"/v2/hourEntries/{current['id']}",
+                                body={k: payload[k] for k in CHECKED if k in payload})
+                updated += 1
+            else:
+                print(f"  OK      {label}")
+                unchanged += 1
 
-        changed = differs(current, payload, target["billable"])
-        if not changed:
-            print(f"  OK      {label}")
-            unchanged += 1
-            continue
-
-        print(f"  UPDATE  {label}  — {', '.join(changed)}")
-        if commit:
-            api.request("PATCH", f"/v2/hourEntries/{current['id']}",
-                        body={k: payload[k] for k in CHECKED if k in payload})
-        updated += 1
+        # A line that used to stand alone and is now joined leaves its own
+        # entry behind; it has to go, or the hours are counted twice.
+        for key in row["keys"][1:]:
+            stale = existing.get(key)
+            if stale is None or not stale.get("isActive", True):
+                continue
+            if stale.get("locked") or stale.get("invoiceId"):
+                print(f"  LOCKED  {label}  — {key} was joined into this entry but is "
+                      f"invoiced in Busy; remove it by hand")
+                continue
+            print(f"  DELETE  {label}  — {key} is now part of this entry")
+            if commit:
+                api.request("PATCH", f"/v2/hourEntries/{stale['id']}", body={"isActive": False})
+            removed += 1
 
     verb = "wrote" if commit else "would write"
-    print(f"\n{verb} {created} new, {updated} updated; {unchanged} already correct, "
-          f"{excluded} excluded, {failed} skipped")
-    if not commit and (created or updated):
+    print(f"\n{verb} {created} new, {updated} updated, {removed} deleted; "
+          f"{unchanged} already correct, {len(excluded)} excluded, {len(failed)} skipped")
+    if force and clashes:
+        print(f"--force: wrote {len(clashes)} entries over hours you had already logged.")
+    if not commit and (created or updated or removed):
         print("Add --commit to write these to Busy.")
     return 1 if failed else 0
 
@@ -405,6 +534,9 @@ def main():
         command.add_argument("entries", help="path to the entries JSON")
         command.add_argument("--commit", action="store_true",
                              help="actually write to Busy (default is a dry run)")
+        if name == "push":
+            command.add_argument("--force", action="store_true",
+                                 help="write entries that overlap hours already logged")
     args = parser.parse_args()
 
     api = Busy(load_token(), DEMO if args.demo else PROD)
@@ -414,7 +546,7 @@ def main():
     entries = read_entries(args.entries)
     if args.command == "undo":
         return undo(api, entries, args.commit)
-    return push(api, entries, args.commit)
+    return push(api, entries, args.commit, args.force)
 
 
 if __name__ == "__main__":
