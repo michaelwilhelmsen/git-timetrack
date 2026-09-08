@@ -719,7 +719,7 @@ def main():
 
     since = None
     if args.since:
-        since = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        since = datetime.strptime(args.since, "%Y-%m-%d").astimezone()
     elif args.days:
         since = datetime.now(timezone.utc) - timedelta(days=args.days)
 
@@ -728,7 +728,7 @@ def main():
     until = None
     if args.until:
         until = (datetime.strptime(args.until, "%Y-%m-%d")
-                 .replace(hour=23, minute=59, second=59, tzinfo=timezone.utc))
+                 .replace(hour=23, minute=59, second=59).astimezone())
 
     if args.report:
         if not since:
