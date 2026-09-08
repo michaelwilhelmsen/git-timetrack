@@ -8,8 +8,8 @@ You know you _worked_ — you were in the zone, fixing things, shipping things. 
 
 Then you ask Claude, and get:
 
-- Per-project activity grouped by day
-- Time estimates based on commit patterns
+- Per-project activity grouped into work sessions
+- Time measured from your Claude Code sessions, not guessed from commits
 - Client-ready summaries in any language
 
 ![Activity report per client](docs/screenshots/timelog-activity.png)
@@ -75,15 +75,36 @@ Use `/map-client` to associate repos with client names. Claude walks through you
 
 > You can also use the full name `/git-timetrack:map-client`.
 
-## How time estimation works
+## How time is worked out
 
-The tool doesn't know when you _started_ working — only when you committed. So it uses heuristics:
+Two sources, and the first one is measured rather than guessed.
 
-- Commits within **2 hours** of each other → the gap counts as work time
+**Claude Code sessions (measured).** Every session writes a transcript to `~/.claude/projects/`, with a timestamp on each message plus the working directory, branch and session title. The reader turns those into real spans — when the work started, when it stopped. Run it any time:
+
+```bash
+python3 ~/.claude/plugins/git-timetrack/bin/session-reader.py
+```
+
+It rebuilds `~/.git-timetrack/sessions.jsonl` from all history in a few seconds. `--report --days 7` rebuilds and prints a compact digest for the range, which is what the timelog skill runs. `--dry-run --days 30` compares measured time against the git estimate without writing anything.
+
+Three knobs, all guesses — the dry run shows what each contributes so you can calibrate:
+
+| Flag | Default | What it does |
+| ---- | ------- | ------------ |
+| `--gap` | 30 min | The pause that ends a stretch of work — and therefore what counts as one billable task. Restarting a session to manage context does not start a new one |
+| `--tail` | 5 min | Padding after a session's last message |
+| `--bridge` | 120 min | Keeps a session whole across a wait while a subagent worked. Capped, because an unattended overnight agent run is machine time, not yours. `0` disables it |
+
+Subagent transcripts are never counted as time of their own — the main session records activity again the moment a subagent reports back, so their work is already inside the session's span.
+
+**Git commits (estimated).** For work done outside Claude Code, the old heuristics still apply:
+
+- Commits within **1.5 hours** of each other → the gap counts as work time
 - **Isolated commits** → estimated at 30min–2hr based on diff size
-- **Branch switches** → +5 minutes for context-switch overhead
 
-These are **approximations**, not invoiceable truth. The tool flags this clearly. Always review before sharing.
+**Billing policy.** The digest bills each session at a minimum of 30 minutes and rounds part-hours up to the next 30-minute step (1h05 bills 1h30). Parallel sessions bill to every client in full — two clients worked at once are both charged, not split. `TOTAL` is therefore above `MEASURED` by design, and the digest prints both so you can see the spread.
+
+Measured spans are used where they exist, with commit estimates elsewhere. Still **read it before sending** — time away from the keyboard mid-session counts as work, and a session left open all evening looks like billable time.
 
 ## What gets tracked
 
@@ -120,14 +141,21 @@ Everything is stored locally in `~/.git-timetrack/activity.jsonl`. Nothing is se
 
 | File         | Location                          | Purpose                                              |
 | ------------ | --------------------------------- | ---------------------------------------------------- |
-| Activity log | `~/.git-timetrack/activity.jsonl` | Append-only event log (created on first git event)   |
+| Activity log | `~/.git-timetrack/activity.jsonl` | Append-only git event log (created on first git event) |
+| Session log  | `~/.git-timetrack/sessions.jsonl` | Measured Claude Code sessions (rebuilt by the reader) |
 | Client map   | `~/.git-timetrack/clients.json`   | Repo → client name mapping                           |
 | Ignore list  | `~/.git-timetrack/ignore`         | Repos to exclude (one name per line)                 |
 
 ## FAQ
 
 **Does this track my time outside of git?**
-No. It only sees git commands run inside Claude Code sessions. Meetings, code review, debugging without committing — invisible. Your actual work time is almost certainly higher than what the tool reports.
+Partly. Claude Code sessions are measured whether or not you commit, so research, debugging and reviews are counted. Work with no Claude Code session and no commit — meetings, editing straight in your IDE — stays invisible, so your real hours are still likely higher than reported.
+
+**Do my prompts leave my machine?**
+No. The reader stores session titles and a few prompts locally in `sessions.jsonl` so reports can be described accurately, and the timelog skill is instructed never to paste prompt text into output. Everything stays in `~/.git-timetrack/`.
+
+**Why do the hours sometimes exceed the day?**
+By policy. Parallel sessions bill to every client, so an hour on two projects is two billed hours, and every session rounds up to a 30-minute step. The digest prints measured activity alongside the billable total, plus how much came from each rule.
 
 **Does this send my data anywhere?**
 No. Everything stays in `~/.git-timetrack/` on your machine.
