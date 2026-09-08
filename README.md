@@ -11,6 +11,7 @@ Then you ask Claude, and get:
 - Per-project activity grouped into work sessions
 - Time measured from your Claude Code sessions, not guessed from commits
 - Client-ready summaries in any language
+- Optionally written straight into [Finago Busy](https://busy.no), instead of retyped by hand
 
 ![Activity report per client](docs/screenshots/timelog-activity.png)
 
@@ -74,6 +75,32 @@ Use `/map-client` to associate repos with client names. Claude walks through you
 ```
 
 > You can also use the full name `/git-timetrack:map-client`.
+
+### Push to Finago Busy
+
+If you track hours in [Finago Busy](https://busy.no), the report doesn't have to be retyped. Ask Claude to push it and the lines are written to Busy's API as hour entries.
+
+```
+/timelog last week
+push those to Busy
+```
+
+Nothing is written until you have seen it. Claude shows a dry run first — one line per entry, with the project and task it will land on — and only writes after you say yes.
+
+Setup takes two files, both in `~/.git-timetrack/` and never in a project you commit:
+
+1. In Busy, an admin creates an API key under workspace settings → integrations, with the scopes `hourEntries:read`, `hourEntries:write`, `projects:read`, `tags:read`, `tasks:read` and `users:read`. Put it in `~/.git-timetrack/busy-token` (mode 600), or set `$BUSY_TOKEN`.
+2. Copy [`busy.json.example`](busy.json.example) to `~/.git-timetrack/busy.json` and fill in your ids. Asking Claude to list your Busy projects prints every project, task, tag and user you can reach, which is where the ids come from.
+
+Each line carries a stable key that becomes the entry's `externalId`, so pushing the same week twice updates the entries it wrote rather than double-booking them. Entries Busy reports as locked or already invoiced are left alone. To take a push back:
+
+```
+undo that push to Busy
+```
+
+Busy's API cannot delete an hour entry, so this marks them deleted — the same thing the interface does.
+
+Clients you don't want in Busy at all go in an `exclude` list, and lunch break deduction is not applied to hours created through the API.
 
 ## How time is worked out
 
@@ -145,6 +172,8 @@ Everything is stored locally in `~/.git-timetrack/activity.jsonl`. Nothing is se
 | Session log  | `~/.git-timetrack/sessions.jsonl` | Measured Claude Code sessions (rebuilt by the reader) |
 | Client map   | `~/.git-timetrack/clients.json`   | Repo → client name mapping                           |
 | Ignore list  | `~/.git-timetrack/ignore`         | Repos to exclude (one name per line)                 |
+| Busy mapping | `~/.git-timetrack/busy.json`      | Finago Busy client → project mapping (optional)      |
+| Busy token   | `~/.git-timetrack/busy-token`     | Finago Busy API key, mode 600 (optional)             |
 
 ## FAQ
 
@@ -158,7 +187,7 @@ No. The reader stores session titles and a few prompts locally in `sessions.json
 By policy. Parallel sessions bill to every client, so an hour on two projects is two billed hours, and every session rounds up to a 30-minute step. The digest prints measured activity alongside the billable total, plus how much came from each rule.
 
 **Does this send my data anywhere?**
-No. Everything stays in `~/.git-timetrack/` on your machine.
+Not unless you ask it to. Tracking and reporting are entirely local. The one exception is the optional Finago Busy push: if you set it up, the lines you approve — date, time, hours, and the description Claude wrote — are sent to your own Busy workspace. Nothing else goes with them, and no prompt text is ever included.
 
 **What about repos I don't want tracked?**
 Add the repo name to `~/.git-timetrack/ignore` (one per line). The handler checks this file before logging.
