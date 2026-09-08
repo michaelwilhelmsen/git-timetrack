@@ -58,6 +58,10 @@ Subagents are read only to bridge gaps: when a subagent worked through a pause l
 
 The `key` becomes the hour entry's `externalId`, which makes a re-push idempotent: the script looks the keys up (`externalIdIn`, `isActive=all`) and creates, patches, revives or skips accordingly. Busy caps an externalId at 50 characters, so the client slug in the key is trimmed — changing `SLUG_CHARS` orphans every entry already written. Hour entries cannot be deleted through the API, only patched to `isActive: false`; that is what `undo` does. Entries Busy reports as locked or invoiced are left untouched.
 
+Two guards sit in front of the write. Lines that meet end-to-end on the same project, task and tag are joined into one entry with the descriptions concatenated, because Busy draws one card per hour entry; only exactly contiguous lines join, since anything looser would change the billed total. And because the `externalId` lookup only ever finds this script's own entries, `push` also reads back the user's hours for the range and stops on any line overlapping one already logged — by hand, or by an earlier push under another key — until `--force`. An entry deleted in Busy stays deleted for the same reason: reviving it would undo a deliberate cleanup on every re-push.
+
+The API answers in UTC with a `Z` suffix while everything here is local, so convert on the way in — comparing the two directly silently shifts every overlap by the offset.
+
 Writing is opt-in: `push` is a dry run unless `--commit`. Tags and tasks may be given by name or id, and a task-based project refuses an entry with no task. Lunch break deduction is not applied automatically to hours created via the API.
 
 **Plugin environment variables** — hooks.json uses `${CLAUDE_PLUGIN_ROOT}` to reference the handler script.
