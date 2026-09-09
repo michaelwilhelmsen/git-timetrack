@@ -30,14 +30,47 @@ Two sources, with different strengths:
 
 Only read `sessions.jsonl` or `activity.jsonl` directly if the digest is missing something specific — and then grep for the few lines you need, never the whole file.
 
-## Per client, output
+## Output format
 
-The output is meant for logging hours into timetracking software — one line per session, copyable as-is (rounded times, rounded duration).
+The output is meant for logging hours into timetracking software — one row per billable line, copyable as-is (rounded times, rounded duration). Use **one markdown table per client**, in this exact shape:
 
-- **Sessions**: one line each — date, rounded start–end time, rounded duration, and a very short description (a few words, e.g. "Cart bug fixes", "Landing page"). A session covering several topics combines them ("Operator console + cleanup fixes"). NO jargon — no "refactor", "CI/CD", "SSH", "MutationObserver", "webpack", etc.
-- **Total hours** for the range
+```markdown
+Timelog for Wednesday 9 September 2026.
 
-Do NOT write draft emails. Output the session lines and the total only.
+### Fru Timian
+
+| Date   | Time        | Hours | Work                                                              |
+|--------|-------------|------:|-------------------------------------------------------------------|
+| Wed 09 | 09:30–12:00 |   2.5 | Staging bug fixes, product video in gallery lightbox, Google Pay  |
+| Wed 09 | 12:30–14:00 |   1.5 | Campaign block content options, search pagination, cart loading   |
+| Wed 09 | 15:00–16:00 |   1.0 | Live TikTok videos in the Reels block, admin styling fix          |
+| Wed 09 | 00:00–00:10 | ~0.1 | Documentation tidy-up *(outside Claude Code, estimated)*          |
+| **Total** |          | **5.0** | *+0.1 estimated*                                                |
+
+### ai-synlighet ⚠️ unmapped
+
+| Date   | Time        | Hours | Work                                                 |
+|--------|-------------|------:|------------------------------------------------------|
+| Wed 09 | 09:30–11:00 |   1.5 | Server access, new question set for Foreldreutvalgene |
+| **Total** |          | **1.5** |                                                    |
+
+### Summary
+
+| Client       | Hours | Est.  |
+|--------------|------:|------:|
+| Fru Timian   |   5.0 |  +0.1 |
+| ai-synlighet |   1.5 |       |
+| **Total**    | **6.5** | **+0.1** |
+```
+
+Rules for the tables:
+
+- **Columns**: `Date` (weekday + day, e.g. `Wed 09`), `Time` (rounded start–end), `Hours` (rounded, right-aligned, one decimal), `Work` (a few words). For a single-day report the `Date` column may be dropped
+- **Total row** per client in bold. Estimated hours from commits outside any session go in the same table, prefixed `~`, marked *(outside Claude Code, estimated)* in `Work`, and kept out of the bold total — show them as *+Xh estimated* beside it
+- **Summary table** at the end when there is more than one client, with the grand total. Skip it for a single client
+- **Flags in the heading**, not in the rows: `⚠️ unmapped` for repos without a client, `⚠️ check attribution` for a session guessed from a deleted repo path. Explain each flag in one sentence under the summary
+- **Descriptions**: a few words, e.g. "Cart bug fixes", "Landing page". A line covering several topics combines them ("Operator console + cleanup fixes"). NO jargon — no "refactor", "CI/CD", "SSH", "MutationObserver", "webpack", etc. Keep each cell to one line so the table stays readable
+- Nothing else: no draft emails, no per-session bullet lists, no prose between the tables beyond the one-line notes for flags
 
 ## Billing policy
 

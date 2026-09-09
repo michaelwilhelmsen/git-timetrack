@@ -49,7 +49,7 @@ Use `/timelog` to summarize your activity. Claude reads your git history and wri
 
 Claude translates `fix: MutationObserver feedback loop in cart widget` into `Fixed an issue where the shopping cart wasn't updating correctly` — a client-ready summary you can use however you like.
 
-You can have a conversation about it: _"Combine those first two bullets."_ _"Make it more formal."_ _"Skip the infrastructure stuff, the client doesn't care."_
+You can have a conversation about it: _"Combine those first two rows."_ _"Make it more formal."_ _"Skip the infrastructure stuff, the client doesn't care."_
 
 ### Import past activity
 
