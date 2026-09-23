@@ -3,7 +3,8 @@
 git-timetrack session reader.
 
 Derives measured work sessions from Claude Code transcripts in
-~/.claude/projects and writes them to ~/.git-timetrack/sessions.jsonl.
+~/.claude/projects and Codex threads in ~/.codex/sessions, and writes them
+to ~/.git-timetrack/sessions.jsonl.
 
 Unlike activity.jsonl (commit points, from which time must be inferred),
 this measures wall-clock spans of real session activity.
@@ -20,6 +21,7 @@ The written log always covers all history; --since and --days narrow the
 """
 
 import argparse
+import bisect
 import importlib.util
 import json
 import math
@@ -28,6 +30,7 @@ import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from itertools import chain
 from pathlib import Path
 
 # ── Paths ───────────────────────────────────────────────────
@@ -36,6 +39,7 @@ DIR         = Path.home() / ".git-timetrack"
 ACTIVITY    = DIR / "activity.jsonl"
 SESSIONS    = DIR / "sessions.jsonl"
 TRANSCRIPTS = Path.home() / ".claude" / "projects"
+CODEX       = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
 # ── Constants ───────────────────────────────────────────────
 
@@ -71,6 +75,8 @@ TS_RE      = re.compile(r'"timestamp":"([^"]+)"')
 CWD_RE     = re.compile(r'"cwd":"([^"]*)"')
 BRANCH_RE  = re.compile(r'"gitBranch":"([^"]*)"')
 ENTRY_RE   = re.compile(r'"entrypoint":"([^"]+)"')
+ROLLOUT_RE = re.compile(r'\{"timestamp":"([^"]+)",(?:"ordinal":\d+,)?"type":"(\w+)"'
+                        r'(?:,"payload":\{"type":"(\w+)")?')
 
 # ── Shared helpers from the hook handler ────────────────────
 
@@ -216,8 +222,181 @@ def split_blocks(stamps, gap, bridges=frozenset()):
 
 
 def pick_by_position(items, first_idx, count):
-    """Select prompts/titles whose file position falls inside a block."""
-    return [text for pos, text in items if first_idx <= pos <= first_idx + count]
+    """Select prompts/titles whose file position falls inside a block.
+
+    A position of None belongs to every block."""
+    return [text for pos, text in items if pos is None or first_idx <= pos <= first_idx + count]
+
+
+def claude_sessions():
+    """One entry per Claude Code transcript, with the spans of its subagents."""
+    for path in transcript_files():
+        stamps, prompts, titles, meta = read_transcript(path)
+        if stamps:
+            yield dict(meta, id=path.stem, stamps=stamps, prompts=prompts, titles=titles,
+                       subagents=subagent_spans(path))
+
+# ── Codex rollouts ──────────────────────────────────────────
+
+CODEX_ENTRYPOINT = "codex"
+
+# Codex wraps what the human typed in context of its own, under a "## My request"
+# heading. Context with no request in it opens with a tag or a heading.
+REQUEST_RE     = re.compile(r"^## My request[^\n:]*:\s*", re.M)
+INJECTED_RE    = re.compile(r"</?[A-Za-z][\w-]*[\s>/]|#+ ")
+ATTACHED       = ("# Files mentioned by the user", "# Files pasted by the user")
+QUESTION_REPLY = "<send_user_message_question_reply>"
+
+
+def codex_files():
+    """Rollouts of every Codex thread. A thread is filed under the local day it
+    started but can run for days after, so the day is no filter."""
+    return (sorted((CODEX / "sessions").glob("*/*/*/rollout-*.jsonl"))
+            + sorted((CODEX / "archived_sessions").glob("rollout-*.jsonl")))
+
+
+def read_rollout(path):
+    """Extract activity timestamps, human prompts and metadata from one Codex rollout.
+
+    Only response items count as activity: event rows keep arriving when a
+    background command exits long after the work. A turn copied in from another
+    agent is stamped with the time of the import, and a turn an automation
+    started ran with nobody there, so neither counts."""
+    meta = {}
+    stamps, prompts = [], []
+    turn = {"stamps": [], "prompts": [], "imported": False, "automated": False}
+
+    def keep(turn):
+        if not turn["imported"] and (turn["prompts"] or not turn["automated"]):
+            stamps.extend(turn["stamps"])
+            prompts.extend(turn["prompts"])
+
+    with open(path, errors="replace") as f:
+        for line in f:
+            match = ROLLOUT_RE.match(line)
+            if not match:
+                continue
+            when, kind, item = match.groups()
+            if kind == "session_meta" and not meta:
+                try:
+                    meta = json.loads(line).get("payload") or {}
+                except Exception:
+                    pass
+            elif kind == "event_msg" and item == "task_started":
+                keep(turn)
+                turn = {"stamps": [], "prompts": [], "automated": False,
+                        "imported": '"turn_id":"external-import-' in line}
+            elif kind == "response_item":
+                stamp = parse_ts(when)
+                if not stamp:
+                    continue
+                turn["stamps"].append(stamp)
+                if item == "message" and '"role":"user"' in line:
+                    for text in user_texts(line):
+                        typed = " ".join(human_text(text).split())
+                        if typed:
+                            turn["prompts"].append((stamp, typed[:MAX_PROMPT_CHARS]))
+                        elif text.lstrip().startswith("<heartbeat>"):
+                            turn["automated"] = True
+                elif item == "function_call_output" and '"output":"<heartbeat>' in line:
+                    turn["automated"] = True
+    keep(turn)
+    return meta, sorted(stamps), prompts
+
+
+def user_texts(line):
+    """The text items of a user-role message row."""
+    try:
+        payload = json.loads(line).get("payload") or {}
+    except Exception:
+        return []
+    if payload.get("role") != "user":
+        return []
+    return [c.get("text") or "" for c in payload.get("content") or []
+            if isinstance(c, dict) and c.get("type") == "input_text"]
+
+
+def human_text(text):
+    """What the human wrote in one user-role item, or "" for context Codex injected."""
+    match = REQUEST_RE.search(text)
+    if match:
+        return text[match.end():].strip()
+    text = text.strip()
+    if text.startswith(QUESTION_REPLY):
+        return question_answers(text)
+    if text.startswith(ATTACHED) or not INJECTED_RE.match(text):
+        return text
+    return ""
+
+
+def question_answers(text):
+    """The human's answers in a reply to questions the agent asked."""
+    body = text[len(QUESTION_REPLY):].split("</send_user_message_question_reply>")[0]
+    try:
+        return " | ".join(str(item["answer"]) for item in json.loads(body) if item.get("answer"))
+    except Exception:
+        return text
+
+
+def codex_titles():
+    """Thread names by thread id. The index is only appended to, so a later row is a rename."""
+    titles = {}
+    try:
+        with open(CODEX / "session_index.jsonl", errors="replace") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                name = " ".join((row.get("thread_name") or "").split())
+                if row.get("id") and name:
+                    titles[row["id"]] = name
+    except OSError:
+        pass
+    return titles
+
+
+def codex_sessions(gap):
+    """One entry per Codex thread, which may be spread over several rollouts.
+
+    Spawned subagents only bridge their parent's gaps, as Claude subagents do,
+    one stretch of activity at a time since one agent can serve for hours. The
+    reviewer that approves commands is left out: it runs only while its parent
+    does, and it wakes as a thread resumes, which would bridge the pause before."""
+    threads = {}
+    spans = defaultdict(list)
+    for path in codex_files():
+        meta, stamps, prompts = read_rollout(path)
+        if not stamps:
+            continue
+        source = meta.get("source")
+        subagent = source.get("subagent") if isinstance(source, dict) else None
+        if subagent is not None:
+            if isinstance(subagent, dict) and "thread_spawn" in subagent:
+                spans[meta.get("parent_thread_id")] += [(start, end) for start, end, _, _
+                                                        in split_blocks(stamps, gap)]
+            continue
+        thread = threads.setdefault(meta.get("id") or path.stem, {
+            "stamps": [], "prompts": [], "branches": set(), "cwd": meta.get("cwd") or ""})
+        thread["stamps"] += stamps
+        thread["prompts"] += prompts
+        branch = (meta.get("git") or {}).get("branch")
+        if branch:
+            thread["branches"].add(branch)
+
+    titles = codex_titles()
+    for thread_id, thread in threads.items():
+        stamps = sorted(thread["stamps"])
+        yield {
+            "id": thread_id,
+            "stamps": stamps,
+            "prompts": [(bisect.bisect_right(stamps, when), text) for when, text in thread["prompts"]],
+            "titles": [(None, titles[thread_id])] if thread_id in titles else [],
+            "cwd": thread["cwd"],
+            "branches": sorted(thread["branches"]),
+            "entrypoints": [CODEX_ENTRYPOINT],
+            "subagents": spans.get(thread_id, []),
+        }
 
 # ── Repo resolution ─────────────────────────────────────────
 
@@ -242,7 +421,7 @@ def resolve_repo(cwd):
 # ── Session building ────────────────────────────────────────
 
 def build_sessions(gap_mins, tail_mins, bridge_mins):
-    """Read every transcript and merge activity blocks into per-repo sessions."""
+    """Read every transcript and Codex thread and merge activity blocks into per-repo sessions."""
     gap = timedelta(minutes=gap_mins)
     tail = timedelta(minutes=tail_mins)
     bridge = timedelta(minutes=bridge_mins)
@@ -250,12 +429,9 @@ def build_sessions(gap_mins, tail_mins, bridge_mins):
     skipped = defaultdict(int)
     bridged = []
 
-    for path in transcript_files():
-        stamps, prompts, titles, meta = read_transcript(path)
-        if not stamps:
-            continue
-
-        repo, resolved = resolve_repo(meta["cwd"])
+    for session in chain(claude_sessions(), codex_sessions(gap)):
+        stamps = session["stamps"]
+        repo, resolved = resolve_repo(session["cwd"])
         if not repo:
             skipped["no cwd"] += 1
             continue
@@ -263,7 +439,7 @@ def build_sessions(gap_mins, tail_mins, bridge_mins):
             skipped[repo] += 1
             continue
 
-        bridges, spans_bridged = find_bridges(stamps, subagent_spans(path), gap, bridge)
+        bridges, spans_bridged = find_bridges(stamps, session["subagents"], gap, bridge)
         bridged.extend(spans_bridged)
 
         for start, end, first_idx, count in split_blocks(stamps, gap, bridges):
@@ -271,13 +447,13 @@ def build_sessions(gap_mins, tail_mins, bridge_mins):
                 "start": start,
                 "end": end + tail,
                 "messages": count,
-                "session_ids": [path.stem],
-                "branches": meta["branches"],
-                "entrypoints": meta["entrypoints"],
-                "cwd": meta["cwd"],
+                "session_ids": [session["id"]],
+                "branches": session["branches"],
+                "entrypoints": session["entrypoints"],
+                "cwd": session["cwd"],
                 "resolved": resolved,
-                "titles": pick_by_position(titles, first_idx, count),
-                "prompts": pick_by_position(prompts, first_idx, count),
+                "titles": pick_by_position(session["titles"], first_idx, count),
+                "prompts": pick_by_position(session["prompts"], first_idx, count),
             })
 
     sessions = {repo: merge_blocks(blocks) for repo, blocks in raw.items()}
@@ -355,25 +531,25 @@ def git_sessions(since):
                 continue
             events[event.get("repo", "")].append((stamp, event))
 
-    gap = timedelta(minutes=GIT_GAP_MINS)
     result = {}
     for repo, rows in events.items():
         if not repo or is_ignored(repo):
             continue
-        rows.sort(key=lambda r: r[0])
-        hours = 0.0
-        sessions = 0
-        group = [rows[0]]
-        for row in rows[1:] + [None]:
-            if row is None or row[0] - group[-1][0] > gap:
-                hours += estimate_git_group(group)
-                sessions += 1
-                if row is not None:
-                    group = [row]
-            elif row is not None:
-                group.append(row)
-        result[repo] = {"hours": hours, "sessions": sessions}
+        groups = git_groups(sorted(rows, key=lambda r: r[0]))
+        result[repo] = {"hours": sum(estimate_git_group(g) for g in groups), "sessions": len(groups)}
     return result
+
+
+def git_groups(rows):
+    """Split time-ordered (stamp, event) rows into stretches of work at gaps over GIT_GAP_MINS."""
+    gap = timedelta(minutes=GIT_GAP_MINS)
+    groups = []
+    for row in rows:
+        if groups and row[0] - groups[-1][-1][0] <= gap:
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+    return groups
 
 
 def estimate_git_group(group):
@@ -501,8 +677,8 @@ def round_clock(when):
     return when.replace(minute=minute, second=0, microsecond=0) + timedelta(hours=hour - when.hour)
 
 
-def load_commits(since, until):
-    """Commits in range, as (local time, event)."""
+def load_commits(since):
+    """Commits from `since` on, as (local time, event)."""
     if not ACTIVITY.exists():
         return []
 
@@ -516,7 +692,7 @@ def load_commits(since, until):
             except Exception:
                 continue
             stamp = parse_ts(event.get("timestamp", ""))
-            if not stamp or stamp < since or (until and stamp > until):
+            if not stamp or stamp < since:
                 continue
             commits.append((stamp.astimezone(), event))
     return commits
@@ -596,13 +772,22 @@ def slug(text):
     return trimmed[:SLUG_CHARS].rstrip("-")
 
 
+def block_sources(block):
+    """Which tools a block's activity came from: "claude", "codex" or both."""
+    return {"codex" if e == CODEX_ENTRYPOINT else "claude" for e in block["entrypoints"]} or {"claude"}
+
+
 def digest_rows(sessions, since, until, gap_mins):
     """One row per billable line: merged per client, billed, commits matched.
+
+    A line keeps the commits made inside it even when it runs past `until`, and
+    a commit inside a session that started before the range is left to that
+    session's line rather than estimated a second time.
 
     Both --report and --json render from this, so the printed digest and the
     machine-readable one can never drift apart."""
     billable = billable_sessions(sessions, since, until, gap_mins)
-    commits = load_commits(since, until)
+    commits = load_commits(since)
     covered = set()
     rows = []
 
@@ -629,6 +814,7 @@ def digest_rows(sessions, since, until, gap_mins):
                                 for b in row["blocks"]),
                 "messages": sum(b["messages"] for b in row["blocks"]),
                 "restarts": len({sid for b in row["blocks"] for sid in b["session_ids"]}),
+                "sources": sorted(set().union(*(block_sources(b) for b in row["blocks"]))),
                 "repos": sorted(row["repos"]),
                 "titles": list(dict.fromkeys(t for b in row["blocks"] for t in b["titles"])),
                 "prompts": list(dict.fromkeys(p for b in row["blocks"] for p in b["prompts"])),
@@ -640,8 +826,15 @@ def digest_rows(sessions, since, until, gap_mins):
 
     outside = defaultdict(list)
     for stamp, event in commits:
-        if event.get("commit_hash") not in covered:
-            outside[get_client(event.get("repo", "")) or event.get("repo", "")].append((stamp, event))
+        repo = event.get("repo", "")
+        if event.get("commit_hash") in covered or (until and stamp > until):
+            continue
+        if any(b["start"] <= stamp <= b["end"] for b in sessions.get(repo, [])):
+            continue
+        outside[get_client(repo) or repo].append((stamp, event))
+    stray = [{"client": client, "commits": group, "hours": estimate_git_group(group)}
+             for client in sorted(outside)
+             for group in git_groups(sorted(outside[client], key=lambda r: r[0]))]
 
     unmapped = set()
     for blocks in billable.values():
@@ -653,12 +846,12 @@ def digest_rows(sessions, since, until, gap_mins):
                     if not get_client(repo):
                         unmapped.add(repo)
 
-    return rows, outside, billable, unmapped
+    return rows, stray, billable, unmapped
 
 
 def digest(sessions, since, until, bridged, gap_mins):
     """Compact, pre-aggregated output for the timelog skill to describe and format."""
-    rows, outside, billable, unmapped = digest_rows(sessions, since, until, gap_mins)
+    rows, stray, billable, unmapped = digest_rows(sessions, since, until, gap_mins)
 
     end_label = (until or datetime.now(timezone.utc)).astimezone()
     print(f"RANGE {since.astimezone():%Y-%m-%d %H:%M} .. {end_label:%Y-%m-%d %H:%M} (local)")
@@ -678,15 +871,16 @@ def digest(sessions, since, until, bridged, gap_mins):
 
         head = (f"  {row['begin']:%a %d.%m}  {row['start']:%H:%M}-{row['end']:%H:%M}  "
                 f"{row['hours']:>4.1f}h")
+        via = "+".join(row["sources"])
         if brief:
             labels = row["titles"] + row["prompts"] + row["commits"]
             first = labels[0][:DIGEST_CHARS] if labels else ""
-            print(f"{head}  [{row['commit_count']}c, {row['restarts']}s, "
+            print(f"{head}  [{row['commit_count']}c, {row['restarts']}s {via}, "
                   f"{'+'.join(row['repos'])}]  {first}")
             continue
 
         print(f"{head}  [{row['messages']} msg, {row['commit_count']} commits, "
-              f"{row['restarts']} session{'s' if row['restarts'] != 1 else ''}, "
+              f"{row['restarts']} {via} session{'s' if row['restarts'] != 1 else ''}, "
               f"{'+'.join(row['repos'])}]")
         for label in ("titles", "prompts"):
             values = row[label][:3]
@@ -699,14 +893,14 @@ def digest(sessions, since, until, bridged, gap_mins):
         if not row["resolved"]:
             print("    NOTE unresolved repo — name guessed from a path that no longer exists")
 
-    if outside:
-        print("\nCOMMITS OUTSIDE ANY SESSION (work without Claude Code — estimate these)")
-        for client in sorted(outside):
-            group = sorted(outside[client], key=lambda r: r[0])
-            hours = estimate_git_group([(r[0], r[1]) for r in group])
-            subjects = list(dict.fromkeys(e.get("commit_message", "") for _, e in group))
-            print(f"  {client}: {len(group)} commits, ~{hours:.1f}h est  "
-                  f"({group[0][0]:%a %d.%m %H:%M}-{group[-1][0]:%H:%M})")
+    if stray:
+        print("\nCOMMITS OUTSIDE ANY SESSION (work without Claude Code or Codex — estimate these)")
+        for group in stray:
+            commits = group["commits"]
+            subjects = list(dict.fromkeys(e.get("commit_message", "") for _, e in commits))
+            print(f"  {group['client']}: {len(commits)} commit{'s' if len(commits) != 1 else ''}, "
+                  f"~{group['hours']:.1f}h est  "
+                  f"({commits[0][0]:%a %d.%m %H:%M}-{commits[-1][0]:%H:%M})")
             print("    " + " | ".join(x[:DIGEST_CHARS] for x in subjects[:MAX_COMMITS_SHOWN]))
 
     overlaps, union = cross_client_overlaps(billable)
@@ -738,7 +932,7 @@ def digest_json(sessions, since, until, gap_mins):
 
     `description` is left empty on purpose: the clock comes from here, the
     client-facing wording from the timelog skill."""
-    rows, outside, _, unmapped = digest_rows(sessions, since, until, gap_mins)
+    rows, stray, _, unmapped = digest_rows(sessions, since, until, gap_mins)
 
     entries = [{
         "key": row["key"],
@@ -749,6 +943,7 @@ def digest_json(sessions, since, until, gap_mins):
         "description": "",
         "evidence": {
             "repos": row["repos"],
+            "sources": row["sources"],
             "sessions": row["restarts"],
             "messages": row["messages"],
             "titles": row["titles"][:6],
@@ -763,11 +958,14 @@ def digest_json(sessions, since, until, gap_mins):
         "total_hours": round(sum(r["hours"] for r in rows), 2),
         "entries": entries,
         "outside_sessions": [{
-            "client": client,
-            "commits": len(group),
-            "estimated_hours": round(estimate_git_group([(s, e) for s, e in group]), 2),
-            "subjects": list(dict.fromkeys(e.get("commit_message", "") for _, e in group)),
-        } for client, group in sorted(outside.items())],
+            "client": group["client"],
+            "date": f"{group['commits'][0][0]:%Y-%m-%d}",
+            "first_commit": f"{group['commits'][0][0]:%H:%M}",
+            "last_commit": f"{group['commits'][-1][0]:%H:%M}",
+            "commits": len(group["commits"]),
+            "estimated_hours": round(group["hours"], 2),
+            "subjects": list(dict.fromkeys(e.get("commit_message", "") for _, e in group["commits"])),
+        } for group in stray],
         "unmapped_repos": sorted(unmapped),
     }, indent=2, ensure_ascii=False))
 
@@ -797,8 +995,8 @@ def main():
                              f"(default {DEFAULT_BRIDGE_MINS}, 0 disables)")
     args = parser.parse_args()
 
-    if not TRANSCRIPTS.is_dir():
-        sys.exit(f"No transcripts at {TRANSCRIPTS}")
+    if not TRANSCRIPTS.is_dir() and not (CODEX / "sessions").is_dir():
+        sys.exit(f"No transcripts at {TRANSCRIPTS} or {CODEX / 'sessions'}")
 
     since = None
     if args.since:

@@ -9,7 +9,7 @@ You know you _worked_ — you were in the zone, fixing things, shipping things. 
 Then you ask Claude, and get:
 
 - Per-project activity grouped into work sessions
-- Time measured from your Claude Code sessions, not guessed from commits
+- Time measured from your Claude Code and Codex sessions, not guessed from commits
 - Client-ready summaries in any language
 - Optionally written straight into [Finago Busy](https://busy.no), instead of retyped by hand
 
@@ -30,6 +30,8 @@ Then you ask Claude, and get:
 ```
 
 That's it. The plugin hooks into your git commands automatically — no configuration needed.
+
+Using Codex as well? Its threads are measured with no setup at all. For the git commands Codex runs to be logged too, add this repository as a plugin marketplace in Codex and install git-timetrack from it.
 
 ## Usage
 
@@ -104,9 +106,13 @@ Clients you don't want in Busy at all go in an `exclude` list, and lunch break d
 
 ## How time is worked out
 
-Two sources, and the first one is measured rather than guessed.
+Three sources, and the first two are measured rather than guessed.
 
-**Claude Code sessions (measured).** Every session writes a transcript to `~/.claude/projects/`, with a timestamp on each message plus the working directory, branch and session title. The reader turns those into real spans — when the work started, when it stopped. Run it any time:
+**Claude Code sessions (measured).** Every session writes a transcript to `~/.claude/projects/`, with a timestamp on each message plus the working directory, branch and session title. The reader turns those into real spans — when the work started, when it stopped.
+
+**Codex threads (measured).** Codex keeps a log of every thread in `~/.codex/sessions/` (or `$CODEX_HOME`), and the reader measures those with exactly the same rules. A Codex thread and a Claude Code session on the same client in the same hour merge into one line, which the digest labels with where the work came from. Two kinds of Codex turn are left out because nobody was at the keyboard: runs started by an automation, and conversations Codex imported from Claude Code, which carry the time of the import.
+
+Run the reader any time:
 
 ```bash
 python3 ~/.claude/plugins/git-timetrack/bin/session-reader.py
@@ -122,12 +128,14 @@ Three knobs, all guesses — the dry run shows what each contributes so you can 
 | `--tail` | 5 min | Padding after a session's last message |
 | `--bridge` | 120 min | Keeps a session whole across a wait while a subagent worked. Capped, because an unattended overnight agent run is machine time, not yours. `0` disables it |
 
-Subagent transcripts are never counted as time of their own — the main session records activity again the moment a subagent reports back, so their work is already inside the session's span.
+Subagent transcripts are never counted as time of their own — the main session records activity again the moment a subagent reports back, so their work is already inside the session's span. Codex's spawned agents are treated the same way, and the reviewer that approves Codex's commands is not counted at all.
 
-**Git commits (estimated).** For work done outside Claude Code, the old heuristics still apply:
+**Git commits (estimated).** For work done in neither Claude Code nor Codex, the old heuristics still apply:
 
 - Commits within **1.5 hours** of each other → the gap counts as work time
 - **Isolated commits** → estimated at 30min–2hr based on diff size
+
+Each stretch of commits is estimated on its own, so a week of scattered commits is not billed as one span from the first to the last. A commit made inside a session that started the day before — a thread running past midnight — belongs to that session's line and is not estimated again.
 
 **Billing policy.** The digest bills each session at a minimum of 30 minutes and rounds part-hours up to the next 30-minute step (1h05 bills 1h30). Parallel sessions bill to every client in full — two clients worked at once are both charged, not split. `TOTAL` is therefore above `MEASURED` by design, and the digest prints both so you can see the spread.
 
@@ -169,7 +177,7 @@ Everything is stored locally in `~/.git-timetrack/activity.jsonl`. Nothing is se
 | File         | Location                          | Purpose                                              |
 | ------------ | --------------------------------- | ---------------------------------------------------- |
 | Activity log | `~/.git-timetrack/activity.jsonl` | Append-only git event log (created on first git event) |
-| Session log  | `~/.git-timetrack/sessions.jsonl` | Measured Claude Code sessions (rebuilt by the reader) |
+| Session log  | `~/.git-timetrack/sessions.jsonl` | Measured Claude Code and Codex sessions (rebuilt by the reader) |
 | Client map   | `~/.git-timetrack/clients.json`   | Repo → client name mapping                           |
 | Ignore list  | `~/.git-timetrack/ignore`         | Repos to exclude (one name per line)                 |
 | Busy mapping | `~/.git-timetrack/busy.json`      | Finago Busy client → project mapping (optional)      |
@@ -178,7 +186,7 @@ Everything is stored locally in `~/.git-timetrack/activity.jsonl`. Nothing is se
 ## FAQ
 
 **Does this track my time outside of git?**
-Partly. Claude Code sessions are measured whether or not you commit, so research, debugging and reviews are counted. Work with no Claude Code session and no commit — meetings, editing straight in your IDE — stays invisible, so your real hours are still likely higher than reported.
+Partly. Claude Code sessions and Codex threads are measured whether or not you commit, so research, debugging and reviews are counted. Work with no session in either tool and no commit — meetings, editing straight in your IDE — stays invisible, so your real hours are still likely higher than reported.
 
 **Do my prompts leave my machine?**
 No. The reader stores session titles and a few prompts locally in `sessions.jsonl` so reports can be described accurately, and the timelog skill is instructed never to paste prompt text into output. Everything stays in `~/.git-timetrack/`.
