@@ -1,6 +1,6 @@
 ---
 name: timelog
-description: "Summarize git and Claude Code activity for time reports, standups, and client updates. Use when the user asks about what they worked on, wants a time report, needs to write a status update, or mentions timelog/weeklog."
+description: "Summarize git, Claude Code and Codex activity for time reports, standups, and client updates. Use when the user asks about what they worked on, wants a time report, needs to write a status update, or mentions timelog/weeklog."
 ---
 
 # Timelog — Summarize work sessions
@@ -9,8 +9,8 @@ Two sources, with different strengths:
 
 | File | What it is | Use it for |
 |---|---|---|
-| `~/.git-timetrack/sessions.jsonl` | **Measured** spans of Claude Code activity | The clock — start, end, duration |
-| `~/.git-timetrack/activity.jsonl` | Commit points from git | What was delivered, and work done outside Claude Code |
+| `~/.git-timetrack/sessions.jsonl` | **Measured** spans of Claude Code and Codex activity | The clock — start, end, duration |
+| `~/.git-timetrack/activity.jsonl` | Commit points from git | What was delivered, and work done in neither tool |
 | `~/.git-timetrack/clients.json` | repo → client mapping | Attribution |
 
 ## Task
@@ -18,14 +18,14 @@ Two sources, with different strengths:
 **Run the reader. Do not parse the logs yourself.** It does the merging, rounding, client grouping, commit matching and overlap detection, and returns a digest of a few KB. Reading the raw logs instead costs tens of thousands of tokens for the same answer.
 
 1. Work out the date range from the request (default: **today**), in the user's local timezone. Support natural language: "today", "yesterday", "this week", "last 3 days", "march", "last month", "since monday", etc.
-2. Run the reader **once** — it rebuilds from the transcripts and prints the digest in the same pass:
+2. Run the reader **once** — it rebuilds from the Claude Code transcripts and Codex threads and prints the digest in the same pass:
    ```bash
    python3 ${CLAUDE_PLUGIN_ROOT}/bin/session-reader.py --report --since 2026-09-01 --until 2026-09-07
    ```
    `--days N` works instead of the dates. It takes a few seconds and only reads local files. If it fails, say so and fall back to reading `activity.jsonl` yourself, noting that the report is then estimated from commits rather than measured.
-3. Read the digest. Each line is `date  start-end  hours  [msg, commits, sessions, repos]` — one stretch of continuous work for one client, already merged and billed per the policy below, followed by its `titles`, `prompts` and `commits` as description material.
+3. Read the digest. Each line is `date  start-end  hours  [msg, commits, sessions, repos]` — one stretch of continuous work for one client, already merged and billed per the policy below, followed by its `titles`, `prompts` and `commits` as description material. The sessions count names where they came from: `3 codex sessions`, `1 claude session`, or `2 claude+codex sessions` when both tools worked on the same stretch.
 4. Write a short description per session from that evidence, preferring `titles`, then `prompts`, then the commit subjects. Commits are the best evidence of what actually shipped
-5. Report the `COMMITS OUTSIDE ANY SESSION` block as its own estimated lines — that is work done without Claude Code
+5. Report the `COMMITS OUTSIDE ANY SESSION` block as its own estimated lines — that is work done in neither Claude Code nor Codex. Each line there is one stretch of commits, already estimated, and a gap over 1.5 hours starts a new one
 6. Never recompute the hours. The digest's numbers are the answer; only the wording is yours
 
 Only read `sessions.jsonl` or `activity.jsonl` directly if the digest is missing something specific — and then grep for the few lines you need, never the whole file.
@@ -44,7 +44,7 @@ Timelog for Wednesday 9 September 2026.
 | Wed 09 | 09:30–12:00 |   2.5 | Staging bug fixes, product video in gallery lightbox, Google Pay  |
 | Wed 09 | 12:30–14:00 |   1.5 | Campaign block content options, search pagination, cart loading   |
 | Wed 09 | 15:00–16:00 |   1.0 | Live TikTok videos in the Reels block, admin styling fix          |
-| Wed 09 | 00:00–00:10 | ~0.1 | Documentation tidy-up *(outside Claude Code, estimated)*          |
+| Wed 09 | 00:00–00:10 | ~0.1 | Documentation tidy-up *(estimated from commits)*                  |
 | **Total** |          | **5.0** | *+0.1 estimated*                                                |
 
 ### ai-synlighet ⚠️ unmapped
@@ -66,7 +66,7 @@ Timelog for Wednesday 9 September 2026.
 Rules for the tables:
 
 - **Columns**: `Date` (weekday + day, e.g. `Wed 09`), `Time` (rounded start–end), `Hours` (rounded, right-aligned, one decimal), `Work` (a few words). For a single-day report the `Date` column may be dropped
-- **Total row** per client in bold. Estimated hours from commits outside any session go in the same table, prefixed `~`, marked *(outside Claude Code, estimated)* in `Work`, and kept out of the bold total — show them as *+Xh estimated* beside it
+- **Total row** per client in bold. Estimated hours from commits outside any session go in the same table, prefixed `~`, marked *(estimated from commits)* in `Work`, and kept out of the bold total — show them as *+Xh estimated* beside it
 - **Summary table** at the end when there is more than one client, with the grand total. Skip it for a single client
 - **Flags in the heading**, not in the rows: `⚠️ unmapped` for repos without a client, `⚠️ check attribution` for a session guessed from a deleted repo path. Explain each flag in one sentence under the summary
 - **Descriptions**: a few words, e.g. "Cart bug fixes", "Landing page". A line covering several topics combines them ("Operator console + cleanup fixes"). NO jargon — no "refactor", "CI/CD", "SSH", "MutationObserver", "webpack", etc. Keep each cell to one line so the table stays readable
@@ -76,7 +76,7 @@ Rules for the tables:
 
 The digest already applies these — never recompute them, and never talk the numbers down:
 
-- The billable unit is **continuous work for one client**, not one Claude Code session. Sessions get restarted mid-task to manage context, so a single billable line routinely spans several sessions and several repos of that client. The `sessions` count on each line shows how many were merged. Never split a line by session, repo, branch or topic
+- The billable unit is **continuous work for one client**, not one Claude Code session or Codex thread. Sessions get restarted mid-task to manage context, and the two tools often work side by side, so a single billable line routinely spans several sessions and several repos of that client. The `sessions` count on each line shows how many were merged. Never split a line by session, tool, repo, branch or topic
 - A started task bills **at least 30 minutes**
 - Part-hours **round up** to the next 30-minute step: 1h05 → 1h30, 2h35 → 3h00
 - **Parallel work bills to every client.** Two clients worked at the same time are both billed in full; the hour is not split between them
@@ -119,7 +119,7 @@ The hours in Busy are live and other people share the workspace, so treat a read
 
 ## What the digest's footer means
 
-- `TOTAL` — the sum to report. An "entry" is one billable line; the `sessions` count inside a line is how many Claude Code sessions it merged
+- `TOTAL` — the sum to report. An "entry" is one billable line; the `sessions` count inside a line is how many Claude Code sessions and Codex threads it merged
 - `MEASURED` — actual session activity, with the two reasons `TOTAL` sits above it: merged gaps under 30 minutes, and rounding up. Both are the billing policy working as intended, not error. Mention the spread only if asked
 - `PARALLEL WORK` — the same wall-clock hour under two clients, from parallel sessions. Correct and already in `TOTAL`: parallel work bills to every client. Do not deduct it, do not flag it as a conflict, do not ask how to split
 - `BRIDGED` — waits where a subagent was working and the user was not prompting. Already included; mention it only if asked
@@ -136,13 +136,15 @@ The digest is already in local time and needs no conversion. These apply only wh
 - The `client` field is often empty — always resolve through `clients.json` by repo name
 - A session line marked `NOTE unresolved repo` had its name guessed from a path that no longer exists (a deleted worktree, a scratch folder). Include the time, but check the guess against the titles and prompts before attributing it to a client — and say which sessions these were
 - `sessions.jsonl` is derived data, rebuilt in full on every reader run — never append to it by hand
+- A record whose `entrypoints` include `codex` came from a Codex thread; every other entrypoint is Claude Code
+- Codex turns started by an automation, and conversations Codex imported from Claude Code, are left out of `sessions.jsonl` on purpose: nobody was working at those times
 
 ## Edge cases
 
 - No `sessions.jsonl` and the reader fails → fall back to `activity.jsonl` only, and say the report is estimated from commits
-- No log files at all → explain that the plugin tracks git commands automatically and reads Claude Code transcripts, and that tracking begins with the next session
+- No log files at all → explain that the plugin tracks git commands automatically and reads Claude Code transcripts and Codex threads, and that tracking begins with the next session
 - Unmapped repos → list them, suggest running `/git-timetrack:map-client`
 - Sessions but no commits in range → normal (research, debugging, reviews). Report the time, describe from titles and prompts
 - A session line with very few messages and a long span → likely a session left open. Flag it rather than billing it silently
-- Commits but no sessions → work done outside Claude Code. Report it estimated, and note the distinction
+- Commits but no sessions → work done in neither Claude Code nor Codex. Report it estimated, and note the distinction
 - No activity in range → say so clearly, suggest a wider range
