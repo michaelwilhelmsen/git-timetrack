@@ -38,6 +38,7 @@ from pathlib import Path
 DIR         = Path.home() / ".git-timetrack"
 ACTIVITY    = DIR / "activity.jsonl"
 SESSIONS    = DIR / "sessions.jsonl"
+SESSION_CLIENTS = DIR / "session-clients.json"
 TRANSCRIPTS = Path.home() / ".claude" / "projects"
 CODEX       = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
@@ -420,6 +421,14 @@ def resolve_repo(cwd):
 
 # ── Session building ────────────────────────────────────────
 
+def load_session_clients():
+    """Session id → client, for a conversation billed to someone other than its repo's client."""
+    try:
+        return json.loads(SESSION_CLIENTS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
 def build_sessions(gap_mins, tail_mins, bridge_mins):
     """Read every transcript and Codex thread and merge activity blocks into per-repo sessions."""
     gap = timedelta(minutes=gap_mins)
@@ -428,6 +437,7 @@ def build_sessions(gap_mins, tail_mins, bridge_mins):
     raw = defaultdict(list)
     skipped = defaultdict(int)
     bridged = []
+    overrides = load_session_clients()
 
     for session in chain(claude_sessions(), codex_sessions(gap)):
         stamps = session["stamps"]
@@ -439,6 +449,7 @@ def build_sessions(gap_mins, tail_mins, bridge_mins):
             skipped[repo] += 1
             continue
 
+        client = overrides.get(session["id"]) or get_client(repo)
         bridges, spans_bridged = find_bridges(stamps, session["subagents"], gap, bridge)
         bridged.extend(spans_bridged)
 
@@ -447,6 +458,7 @@ def build_sessions(gap_mins, tail_mins, bridge_mins):
                 "start": start,
                 "end": end + tail,
                 "messages": count,
+                "client": client,
                 "session_ids": [session["id"]],
                 "branches": session["branches"],
                 "entrypoints": session["entrypoints"],
@@ -461,17 +473,19 @@ def build_sessions(gap_mins, tail_mins, bridge_mins):
 
 
 def merge_blocks(blocks):
-    """Union overlapping blocks within a repo so parallel sessions count once."""
+    """Union overlapping blocks of one client within a repo so parallel sessions count once."""
     merged = []
+    last = {}
     for block in sorted(blocks, key=lambda b: b["start"]):
-        if merged and block["start"] <= merged[-1]["end"]:
-            prev = merged[-1]
+        prev = last.get(block["client"])
+        if prev and block["start"] <= prev["end"]:
             prev["end"] = max(prev["end"], block["end"])
             prev["messages"] += block["messages"]
             for key in ("session_ids", "branches", "entrypoints", "titles", "prompts"):
                 prev[key] = list(dict.fromkeys(prev[key] + block[key]))
         else:
-            merged.append(dict(block))
+            last[block["client"]] = dict(block)
+            merged.append(last[block["client"]])
     return merged
 
 
@@ -483,7 +497,7 @@ def to_record(repo, block):
         "hours": round(hours, 2),
         "event": "session",
         "repo": repo,
-        "client": get_client(repo),
+        "client": block["client"],
         "branches": block["branches"],
         "entrypoints": block["entrypoints"],
         "session_ids": block["session_ids"],
@@ -713,7 +727,7 @@ def billable_sessions(sessions, since, until, merge_mins):
         for block in blocks:
             if block["start"] < since or (until and block["start"] > until):
                 continue
-            client = get_client(repo) or repo
+            client = block["client"] or repo
             by_client[client].append((block["start"].astimezone(),
                                       block["end"].astimezone(), repo, block))
 
@@ -840,11 +854,8 @@ def digest_rows(sessions, since, until, gap_mins):
     for blocks in billable.values():
         for row in blocks:
             for block in row["blocks"]:
-                if not block.get("resolved"):
-                    continue
-                for repo in row["repos"]:
-                    if not get_client(repo):
-                        unmapped.add(repo)
+                if block.get("resolved") and not block["client"]:
+                    unmapped.update(row["repos"])
 
     return rows, stray, billable, unmapped
 
