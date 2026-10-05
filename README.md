@@ -179,6 +179,7 @@ Everything is stored locally in `~/.git-timetrack/activity.jsonl`. Nothing is se
 | Activity log | `~/.git-timetrack/activity.jsonl` | Append-only git event log (created on first git event) |
 | Session log  | `~/.git-timetrack/sessions.jsonl` | Measured Claude Code and Codex sessions (rebuilt by the reader) |
 | Client map   | `~/.git-timetrack/clients.json`   | Repo → client name mapping                           |
+| Session overrides | `~/.git-timetrack/session-clients.json` | Session id → client, for a conversation billed to someone other than its repo's client (optional) |
 | Ignore list  | `~/.git-timetrack/ignore`         | Repos to exclude (one name per line)                 |
 | Busy mapping | `~/.git-timetrack/busy.json`      | Finago Busy client → project mapping (optional)      |
 | Busy token   | `~/.git-timetrack/busy-token`     | Finago Busy API key, mode 600 (optional)             |
